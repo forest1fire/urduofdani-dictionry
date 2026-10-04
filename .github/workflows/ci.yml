@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.9", "3.11", "3.13"]
+        include:
+          # Windows is a first-class target for this project, so it gets its own leg
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test suite
+        run: python run_tests.py
+      - name: Front door smoke test
+        run: |
+          python urduofdani.py --help
+          python urduofdani.py modes
+          python urduofdani.py info
+      - name: Verify the shipped artifacts (8 checks each)
+        run: |
+          python urduofdani.py verify
+          python urduofdani.py verify --full
+      - name: Examples run on a headless machine
+        run: |
+          python examples/quickstart.py
+          python examples/autocomplete_app.py --list
+
+  determinism:
+    name: artifacts rebuild byte-identically
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Rebuild both shipped tiers and compare SHA-256
+        run: |
+          python urduofdani.py build --mode default -o /tmp/rebuild.txt.gz
+          python urduofdani.py build --mode full    -o /tmp/rebuild.full.txt.gz
+          cmp urdu_database.txt.gz      /tmp/rebuild.txt.gz
+          cmp urdu_database.full.txt.gz /tmp/rebuild.full.txt.gz
+          echo "both artifacts are byte-identical to a fresh build"
+
+  audit:
+    name: full audit protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tests, artifacts, docs, tier table, examples
+        run: python urduofdani.py audit
+      - name: Documentation audit (verbose)
+        run: python tools/audit_docs.py -v

@@ -6,8 +6,16 @@ Everything here is stdlib-only Python — no virtualenv gymnastics, no build sys
 ```bash
 git clone https://github.com/forest1fire/urduofdani-dictionary.git
 cd urduofdani-dictionary
-python build_urdu_database.py --verify --benchmark 10
+python run_tests.py                 # 58 tests, ~3 s, stdlib only
+python urduofdani.py verify         # 8 integrity checks on the shipped artifact
+python urduofdani.py info           # words, size, RAM, load time
 ```
+
+One front door covers the everyday work: `info`, `build`, `verify`, `bench`,
+`search`, `check`, `suggest`, `export`, `random`, `test` and `modes`
+(`python urduofdani.py --help`), plus `audit` — which runs the whole protocol
+(tests · artifact verification · docs audit · tier table · examples) in one shot.
+`build_urdu_database.py` remains the engine and keeps its own long-standing flags.
 
 ## The one rule that must never break
 
@@ -21,9 +29,12 @@ python build_urdu_database.py --verify --benchmark 10
 | Characters | Urdu/Arabic-script letters only — no digits, no Latin, no punctuation |
 | Duplicates | none |
 | Container | standard gzip (`gzip -t` must pass) |
-| Determinism | same seeds ⇒ same SHA-256 |
+| Determinism | same seeds ⇒ same SHA-256 (CI rebuilds and compares) |
+| Sacred names | all 373 canonical names present, 0 inflected |
 
-`python build_urdu_database.py --verify` proves all of the above. **Run it in every PR.**
+`python urduofdani.py verify` proves all of the above and exits non-zero on
+failure. **Run it, plus `python run_tests.py`, in every PR** — CI does the same on
+Linux and Windows.
 
 ## Adding words (the most valuable contribution)
 
@@ -47,7 +58,14 @@ git diff --stat          # urdu_database.txt.gz should change
   suffix, prefix or compound is ever generated from them;
 * `is_sacred_derivative()` inside `_add()` rejects any token built by adding an
   inflection marker (`وں، یں، اں، ات، ے، ؤں`) to a sacred name;
-* `--verify` asserts `sacred names intact: N present, 0 inflected`.
+* `--verify` asserts `sacred names intact: N present, 0 inflected`;
+* the pool itself is checked: an inflected form must never be *added* to a sacred
+  block, because the guard treats pool members as canonical
+  (`tests/test_urduofdani.py::test_pool_contains_no_inflected_entries`);
+* `SACRED_HOMOGRAPH_STEMS` lists divine names that are also ordinary nouns
+  (`ملک`, `حق`, `حکم`, `شہید`, `مقدم`, …) — their everyday inflections
+  (`ملکوں`, `شہیدوں`, `مقدمے`) stay in the dictionary. Add a stem there only when
+  the ordinary reading is the dominant one.
 
 When adding a name, keep it as **one token, correct Urdu orthography, no
 honorific phrases** (`محمد` ✅, `محمد صلی اللہ علیہ وسلم` ❌ — that is three tokens).
@@ -58,10 +76,15 @@ If you add a title, add the fused single-token form used in Urdu text
 
 | Mode | Words | Runs in |
 |---|---|---|
-| *(default)* | 24,809 | every build — seeds, plurals, gender, verbs, compounds, curated agentives, 375 sacred names |
-| `--exhaustive` | 42,358 | section-gated affix families |
-| `--unlimited --depth 1-4` | 47k → 114k | no cap; deeper combinatorics per level |
-| `--recall` | 2,596,675 | raw cross product (machine tier, never a quality claim) |
+| `mini` | 3,000 | embedded / low-RAM targets |
+| `default` | 25,320 | every build — seeds, plurals, gender, verbs, compounds, curated agentives, 373 sacred names |
+| `exhaustive` | 43,043 | section-gated affix families |
+| `wide` | 57,806 | relational forms, `والا` family, market heads |
+| `full` | 116,184 | deep combinatorics, no cap (the shipped `.full`) |
+| `recall` | 2,636,229 | raw cross product (machine tier, never a quality claim) |
+
+Regenerate the numbers with `python tools/measure_tiers.py --table`, and prove the
+README still matches with `python tools/measure_tiers.py --check README.md`.
 
 Curated seeds are the *quality* dial: every word you add to `ADDITIONAL_SEEDS`,
 `NAME_WORDS`, `MEDICAL_WORDS`, `AGRI_WORDS`, `LAW_WORDS`, `MILITARY_WORDS`,
@@ -99,18 +122,26 @@ the default build free of junk like `کمآسان`.
 ## Tests before you push
 
 ```bash
-python build_urdu_database.py --verify --benchmark 10        # format + speed
-python build_urdu_database.py --exhaustive -o /tmp/x.gz      # gated expansion
-python build_urdu_database.py --unlimited --depth 2 -o /tmp/u.gz
-python -c "from build_urdu_database import UrduEngine; e=UrduEngine(); print(len(e), 'کمپیوٹر' in e)"
+python urduofdani.py audit                             # EVERY gate in one command
+python run_tests.py                                    # the suite (must be green)
+python urduofdani.py verify                            # 8 format checks
+python urduofdani.py bench -r 10                       # speed
+python tools/measure_tiers.py                          # every tier still builds
+python tools/audit_docs.py                             # docs still match reality
+python urduofdani.py build --mode exhaustive -o /tmp/x.gz
+python urduofdani.py build --mode wide -o /tmp/w.gz
 ```
 
 Rebuild the committed artifacts whenever you change seeds:
 
 ```bash
-python build_urdu_database.py --verify --benchmark 5                       # default
-python build_urdu_database.py --unlimited --depth 4 -o urdu_database.full.txt.gz
+python urduofdani.py build --mode default -o urdu_database.txt.gz
+python urduofdani.py build --mode full    -o urdu_database.full.txt.gz
+python urduofdani.py verify && python urduofdani.py verify -F
 ```
+
+Both artifacts are byte-reproducible: a clean rebuild must produce the same
+SHA-256, and CI fails if it does not.
 
 ## Assets
 
@@ -121,6 +152,15 @@ bash assets/build_assets.sh     # needs ImageMagick + DejaVu fonts
 ```
 
 `assets/logo.svg` is hand-authored — edit the SVG directly, not the PNG.
+
+## Repository hygiene
+
+* Keep the root tidy: engine + front door + runner + databases + docs; everything
+  else belongs in `tests/`, `examples/`, `tools/` or `assets/`.
+* Generated files (`*.gz` tiers other than the two shipped ones, plain-text
+  exports, `__pycache__`) stay out of Git — `.gitignore` already covers them.
+* `tools/audit_docs.py` and `tools/measure_tiers.py --check README.md` are the
+  anti-drift gate: if you change a number, change it everywhere.
 
 ## Commit messages
 

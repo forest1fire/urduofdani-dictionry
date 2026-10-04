@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # urduofdani :: build_assets.sh
 # Rebuilds the branded raster assets (banner, logo, social preview) from
-# assets/banner-bg.png (the base artwork) using ImageMagick.
+# assets/banner-bg.jpg (the base artwork) using ImageMagick.
 #
 #   bash assets/build_assets.sh
 #
@@ -51,7 +51,7 @@ convert chipped.png \
   -font "$FONT_B" -fill "$WHITE" -pointsize 108 -kerning 1 -annotate +92+240 "urduofdani" \
   \( rule.png \) -geometry +94+282 -compose over -composite \
   -font "$FONT_B" -fill "$MUTED" -pointsize 22 -kerning 5 -annotate +94+336 "MODERN HIGH-SPEED URDU TEXT ENGINE" \
-  -font "$FONT_R" -fill "#8fa6c0" -pointsize 19 -kerning 3 -annotate +94+380 "24,809 WORDS      71.7 KB .GZ      ~2.5 MS LOAD      0 DEPENDENCIES" \
+  -font "$FONT_R" -fill "#8fa6c0" -pointsize 19 -kerning 3 -annotate +94+380 "25,320 WORDS      73.0 KB .GZ      ~2.9 MS LOAD      0 DEPENDENCIES" \
   -font "$FONT_B" -fill "$TEAL" -pointsize 20 -kerning 3 -annotate +112+429 "SINGLE-SPACE TOKENIZATION  x  GZIP LEVEL 9" \
   $STRIP banner.png
 
@@ -102,7 +102,7 @@ convert social-base.png social-scrim.png -compose over -composite \
   -stroke none \
   -font "$FONT_B" -fill "$WHITE" -pointsize 96 -kerning 1 -annotate +84+300 "urduofdani" \
   -font "$FONT_B" -fill "$MUTED" -pointsize 21 -kerning 5 -annotate +86+368 "MODERN HIGH-SPEED URDU TEXT ENGINE" \
-  -font "$FONT_R" -fill "#8fa6c0" -pointsize 21 -kerning 2 -annotate +86+414 "24,809 words  |  71.7 KB .gz  |  ~2.5 ms load  |  stdlib only" \
+  -font "$FONT_R" -fill "#8fa6c0" -pointsize 21 -kerning 2 -annotate +86+414 "25,320 words  |  73.0 KB .gz  |  ~2.9 ms load  |  stdlib only" \
   -font "$FONT_B" -fill "$TEAL" -pointsize 19 -kerning 3 -annotate +104+468 "SINGLE-SPACE TOKENIZATION  x  GZIP LEVEL 9" \
   $STRIP social-preview.png
 rm -f social-base.png social-scrim.png social-mask.png

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import codecs
 import gzip
 import hashlib
 import os
@@ -60,12 +61,14 @@ import time
 import tracemalloc
 import unicodedata
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Sequence, Set, Tuple
 
 __all__ = [
     "UrduEngine",
+    "SACRED_NAMES",
+    "is_sacred_derivative",
     "build_urdu_database",
     "load_urdu_database",
     "iter_urdu_words",
@@ -76,7 +79,7 @@ __all__ = [
     "compile_lexicon",
 ]
 
-SCRIPT_VERSION = "2.0.0"
+SCRIPT_VERSION = "3.0.0"
 DB_FILENAME = "urdu_database.txt.gz"
 SEPARATOR = " "
 GZIP_LEVEL = 9            # maximum deflate ratio: this is what collapses MB -> KB
@@ -173,7 +176,8 @@ def urdu_plurals(word: str, loanword: bool = False) -> List[str]:
 
     if loanword:
         if not word.endswith(("ی", "ہ", "ا")):
-            out.append(word + "ز")                   # لنکس، کمپیوٹرز، سرورز
+            out.append(word + "س")                   # لنکس، نوٹس، اسٹیشنس (press style)
+            out.append(word + "ز")                   # کمپیوٹرز، سرورز، ٹریلرز (variant)
         out.append(word + "وں")                      # موبائلوں، فائلوں
         if word[-1] in "فلہنمیے":
             out.append(word + "یں")                  # فائلیں، ایپس -> ایپیں (rare)
@@ -223,6 +227,17 @@ def _sacred_set() -> Set[str]:
     return {w for w in (canonicalize(t) for t in blob.split()) if w}
 
 
+# Sacred names that are *also* ordinary Urdu vocabulary (homographs). For these
+# the everyday reading wins: "ملکوں" (countries), "شہیدوں" (martyrs),
+# "مقدمے" (lawsuits) and "برے" (oblique of برا) are real words, so the
+# never-inflect guard must not delete them. Proper names - اللہ، محمد، علی،
+# حسن، حسین، فاطمہ، مریم، نوح، ابراہیم and the rest - stay fully protected.
+SACRED_HOMOGRAPH_STEMS: Set[str] = {
+    "اول", "بر", "ثابت", "حق", "حلیم", "حمد", "حکم", "حکیم", "رسالت",
+    "شہید", "عمر", "مقدم", "ملک", "ولی", "وکیل",
+}
+
+
 def is_sacred_derivative(token: str) -> bool:
     """True when *token* is a sacred name carrying a plural/case inflection.
 
@@ -230,11 +245,16 @@ def is_sacred_derivative(token: str) -> bool:
     "اللہوں", "محمدوں" or "علیوں": sacred names are stored exactly as written
     and are never pluralised, suffixed, prefixed or compounded.
     """
-    if not SACRED_NAMES or token in SACRED_NAMES:
+    if not SACRED_NAMES:
+        return False
+    # canonicalise first: the guard must also hold for --keep-diacritics builds
+    token = canonicalize(token)
+    if not token or token in SACRED_NAMES:
         return False
     for marker in _INFLECTION_MARKERS:
         if token.endswith(marker) and len(token) > len(marker):
-            if token[:-len(marker)] in SACRED_NAMES:
+            stem = token[:-len(marker)]
+            if stem in SACRED_NAMES and stem not in SACRED_HOMOGRAPH_STEMS:
                 return True
     return False
 
@@ -268,7 +288,7 @@ def attach_suffix(word: str, suffix: str) -> str:
         if last in "یے":
             return ""
         if last == "ا":
-            return word[:-1] + ("ئی" if word.endswith("یا") else "ائی")
+            return word[:-1] + "ائی"      # دریا -> دریائی، ہوا -> ہوائی، دعا -> دعائی
         if last in "ہۂ":
             return ""
     if suffix[0] == last and last not in "او":  # double-letter guard
@@ -875,7 +895,9 @@ NABI_NAMES: str = (
     "آدم ادریس نوح ہود صالح ابراہیم لوط اسماعیل اسحاق یعقوب یوسف ایوب شعیب "
     "موسی ہارون ذوالکفل داؤد سلیمان الیاس الیسع یونس زکریا یحیی عیسی محمد "
     "احمد مصطفی مجتبی مرتضی شیت خضر لقمان عزیر یوشع اشموئیل شموئیل ذوالقرنین "
-    "نبی انبیا نبیوں رسول رسل رسالت پیغمبر پیغمبروں نبوت وحی رسالت "
+    "نبی انبیا رسول رسل رسالت پیغمبر نبوت وحی "        # canonical forms only:
+    # an inflected form must never enter the pool itself, otherwise the
+    # never-inflect guard would treat it as a name and ship it verbatim.
     "خاتم النبیین خاتمالنبیین رحمۃ اللعالمین رحمۃللعالمین "
 )
 
@@ -905,6 +927,13 @@ SAHABA_NAMES: str = (
 # Canonical (folded) form of every sacred name. Built once at import, then used
 # as the hard guard that keeps the dictionary from ever inflecting them.
 SACRED_NAMES: Set[str] = _sacred_set()
+
+# Third seed tier: supplementary banks that are merged into their section.
+EXTRA_TIER_SEEDS: Dict[str, str] = {
+    "food": FOOD_EXTRA_WORDS,
+    "household": HOUSE_EXTRA_WORDS,
+}
+
 
 # Explicit irregular / idiomatic derivations that no rule should invent.
 EXTRA_FORMS: Dict[str, Tuple[str, ...]] = {
@@ -1085,12 +1114,6 @@ _ORDINAL_SKIP: Set[str] = {
 }
 
 # Words that take "والا / والی / والے" (concrete, agentive nouns).
-CONCRETE_SECTIONS: Set[str] = {
-    "place", "person", "body", "food", "household", "clothing", "tech",
-    "sport", "nature", "tool", "transport", "medical", "agri", "art",
-    "business", "religion", "society", "education", "military", "law",
-}
-
 
 @dataclass(frozen=True)
 class Rule:
@@ -1153,13 +1176,6 @@ MARKET_SECTIONS: Set[str] = {
     "clothing", "art", "education", "medical", "nature",
 }
 
-# Sections whose words are loanwords / proper names: they take suffix and
-# compound growth, but never native aspectual prefixes (بے، نا، غیر، ہم ...).
-LOAN_SECTIONS: Set[str] = {
-    "tech", "proper", "name", "function", "number", "science", "sport",
-    "transport", "military", "color",
-}
-
 # Compound heads that genuinely fuse into ONE Urdu token, per section.
 # ("چائے" + "خانہ" = چائے خانہ، "سبزی" + "منڈی" = سبزی منڈی، ...)
 HEADS: Dict[str, Tuple[str, ...]] = {
@@ -1185,9 +1201,6 @@ HEADS: Dict[str, Tuple[str, ...]] = {
     "tech": ("گاہ",),
 }
 
-
-# Verb-derived single-token nouns (root + affix) that Urdu really builds.
-VERB_NOUN_SUFFIXES: Tuple[str, ...] = ("ائی", "اوٹ", "اک", "ار")
 
 
 
@@ -1235,10 +1248,12 @@ class LexiconForge:
         return [w for w in blob.split() if w]
 
     def _sections(self) -> Dict[str, List[str]]:
+        """Base seeds + second-tier seeds + third-tier extras, merged per section."""
         merged: Dict[str, List[str]] = {}
         for name, words in self._base_sections().items():
-            extra = ADDITIONAL_SEEDS.get(name, "")
-            merged[name] = words + self._split(extra)
+            tier2 = ADDITIONAL_SEEDS.get(name, "")
+            tier3 = EXTRA_TIER_SEEDS.get(name, "")
+            merged[name] = words + self._split(tier2) + self._split(tier3)
         return merged
 
     @staticmethod
@@ -1949,21 +1964,29 @@ def load_urdu_database(path: str | os.PathLike[str] = DB_FILENAME) -> List[str]:
 
 def iter_urdu_words(path: str | os.PathLike[str] = DB_FILENAME,
                     block_bytes: int = 1 << 20) -> Iterator[str]:
-    """Stream words with constant memory - for multi-hundred-MB dictionaries."""
+    """Stream words with constant memory - for multi-hundred-MB dictionaries.
+
+    Uses an *incremental* UTF-8 decoder, so a multi-byte Urdu character that
+    straddles a read boundary is never dropped (the previous implementation used
+    ``errors="ignore"`` and could corrupt a token every ``block_bytes``).
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
     with gzip.open(path, "rb") as fh:
         carry = ""
         while True:
             block = fh.read(block_bytes)
             if not block:
                 break
-            text = carry + block.decode("utf-8", errors="ignore")
+            text = carry + decoder.decode(block)      # keeps partial chars buffered
             parts = text.split(SEPARATOR)
             carry = parts.pop()
             for word in parts:
                 if word:
                     yield word
-        if carry:
-            yield carry
+        carry += decoder.decode(b"", final=True)
+        for word in carry.split(SEPARATOR):
+            if word:
+                yield word
 
 
 # ---------------------------------------------------------------------------
@@ -1988,6 +2011,7 @@ class UrduEngine:
         self._words: List[str] = []
         self._lookup: Set[str] = set()
         self.load_seconds = 0.0
+        self.last_extend_skipped = 0
         if not lazy:
             self.load()
 
@@ -1999,13 +2023,25 @@ class UrduEngine:
         self.load_seconds = time.perf_counter() - t0
         return self
 
-    def extend(self, words: Iterable[str]) -> "UrduEngine":
-        """Merge your own app/domain vocabulary and re-index in one pass."""
+    def extend(self, words: Iterable[str], strict: bool = True) -> "UrduEngine":
+        """Merge your own app/domain vocabulary and re-index in one pass.
+
+        Multi-word input is **skipped** instead of being silently fused:
+        ``"میرا لفظ"`` is two words, so it is not added as ``"میرالفظ"``.
+        Pass ``strict=False`` to keep the old fuse-anything behaviour.
+        """
         merged = set(self._lookup)
+        skipped = 0
         for word in words:
+            if strict and len(str(word).split()) != 1:
+                skipped += 1
+                continue
             token = canonicalize(word)
             if is_valid_token(token):
                 merged.add(token)
+            else:
+                skipped += 1
+        self.last_extend_skipped = skipped
         self._words = sorted(merged)
         self._lookup = merged
         return self
@@ -2078,15 +2114,21 @@ def _locate_database() -> Path:
 # 7. VERIFY + BENCHMARK
 # ---------------------------------------------------------------------------
 def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
-                    export_txt: str | os.PathLike[str] | None = None) -> bool:
-    """Integrity check: gzip stream, single-line payload, no junk, no dupes."""
+                    export_txt: str | os.PathLike[str] | None = None,
+                    quiet: bool = False) -> bool:
+    """Integrity check: gzip stream, single-line payload, no junk, no dupes.
+
+    Set *quiet* when calling it from a library or a test suite - the report is
+    then returned via ``True``/``False`` only, with nothing printed.
+    """
     path = Path(path)
     with gzip.open(path, "rb") as fh:
         raw = fh.read()
     text = raw.decode("utf-8")
-    words = text.split(SEPARATOR)
+    words = [w for w in text.split(SEPARATOR) if w]
+    unique = set(words)
 
-    present_sacred = sum(1 for w in words if w in SACRED_NAMES)
+    present_sacred = sum(1 for w in unique if canonicalize(w) in SACRED_NAMES)
     checks: List[Tuple[str, bool, str]] = [
         ("gzip readable", True, "%d bytes packed payload" % path.stat().st_size),
         ("sacred names intact", not any(is_sacred_derivative(w) for w in words),
@@ -2094,22 +2136,46 @@ def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
         ("no newline", "\n" not in text and "\r" not in text, "single line"),
         ("no comma", "," not in text, "comma-free"),
         ("no digits", not _FORBIDDEN.search(text), "digit-free"),
-        ("no duplicates", len(words) == len(set(words)),
-         "%d tokens / %d unique" % (len(words), len(set(words)))),
+        ("non-empty database", len(words) > 0, "%d tokens" % len(words)),
+        ("no duplicates", len(words) == len(unique),
+         "%d tokens / %d unique" % (len(words), len(unique))),
         ("all tokens legal", all(is_valid_token(w) for w in words), "100% Urdu letters"),
     ]
     ok = all(passed for _, passed, _ in checks)
-    print("[urduofdani] verifying %s" % path.name)
-    for name, passed, detail in checks:
-        print("    [%s] %-18s %s" % ("PASS" if passed else "FAIL", name, detail))
+    if not quiet:
+        print("[urduofdani] verifying %s" % path.name)
+        for name, passed, detail in checks:
+            print("    [%s] %-18s %s" % ("PASS" if passed else "FAIL", name, detail))
 
     if export_txt:
         Path(export_txt).write_bytes(raw)          # raw == the plain single-line text
-        print("    [OK]   exported plain text -> %s" % export_txt)
+        if not quiet:
+            print("    [OK]   exported plain text -> %s" % export_txt)
     return ok
 
 
-def benchmark(path: str | os.PathLike[str] = DB_FILENAME, repeats: int = 5) -> Dict[str, float]:
+def _print_benchmark(path: Path, words: List[str], packed: int, raw_bytes: int,
+                     saved: float, best: float, avg: float, timings: List[float],
+                     peak: int, per_sec: float) -> None:
+    """Render the human-readable benchmark report (kept out of benchmark())."""
+    print("\n" + "=" * 68)
+    print(" urduofdani :: B E N C H M A R K")
+    print("=" * 68)
+    print("  database          : %s" % path.name)
+    print("  words             : %s" % f"{len(words):,}")
+    print("  packed (.gz)      : %s" % _human(packed))
+    print("  unpacked (RAM)    : %s" % _human(raw_bytes))
+    print("  compression saved : %.1f%%" % saved)
+    print("  cold load (best)  : %.3f ms" % best)
+    print("  cold load (avg)   : %.3f ms   (%d runs)" % (avg, len(timings)))
+    print("  throughput        : %s words/sec" % f"{per_sec:,.0f}")
+    print("  peak RAM (loader) : %s" % _human(peak))
+    print("  engine ready      : UrduEngine().load_seconds -> %.6f s" % (best / 1000.0))
+    print("=" * 68 + "\n")
+
+
+def benchmark(path: str | os.PathLike[str] = DB_FILENAME, repeats: int = 5,
+              quiet: bool = False) -> Dict[str, float]:
     """Measure cold decompression + list construction in milliseconds."""
     path = Path(path)
     packed = path.stat().st_size
@@ -2133,20 +2199,8 @@ def benchmark(path: str | os.PathLike[str] = DB_FILENAME, repeats: int = 5) -> D
     per_sec = len(words) / (avg / 1000.0) if avg else 0.0
     saved = (1 - packed / raw_bytes) * 100.0 if raw_bytes else 0.0
 
-    print("\n" + "=" * 68)
-    print(" urduofdani :: B E N C H M A R K")
-    print("=" * 68)
-    print("  database          : %s" % path.name)
-    print("  words             : %s" % f"{len(words):,}")
-    print("  packed (.gz)      : %s" % _human(packed))
-    print("  unpacked (RAM)    : %s" % _human(raw_bytes))
-    print("  compression saved : %.1f%%" % saved)
-    print("  cold load (best)  : %.3f ms" % best)
-    print("  cold load (avg)   : %.3f ms   (%d runs)" % (avg, len(timings)))
-    print("  throughput        : %s words/sec" % f"{per_sec:,.0f}")
-    print("  peak RAM (loader) : %s" % _human(peak))
-    print("  engine ready      : UrduEngine().load_seconds -> %.6f s" % (best / 1000.0))
-    print("=" * 68 + "\n")
+    if not quiet:
+        _print_benchmark(path, words, packed, raw_bytes, saved, best, avg, timings, peak, per_sec)
 
     return {
         "words": float(len(words)),
@@ -2180,7 +2234,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-o", "--output", default=DB_FILENAME, help="output .gz path")
     p.add_argument("-m", "--max-words", type=int, default=0,
-                   help="cap the lexicon (0 = unlimited / exhaustive)")
+                   help="cap the lexicon (0 = no cap: keep every generated token)")
     p.add_argument("--min-len", type=int, default=2, help="minimum token length")
     p.add_argument("--max-len", type=int, default=40, help="maximum token length")
     p.add_argument("--keep-diacritics", action="store_true",
