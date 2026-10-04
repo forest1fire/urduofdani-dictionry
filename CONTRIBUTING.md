@@ -39,6 +39,21 @@ python build_urdu_database.py --verify --benchmark 5
 git diff --stat          # urdu_database.txt.gz should change
 ```
 
+### Where extra words come from (the mode ladder)
+
+| Mode | Words | Runs in |
+|---|---|---|
+| *(default)* | 24,589 | every build — seeds, plurals, gender, verbs, compounds, curated agentives |
+| `--exhaustive` | 42,138 | section-gated affix families |
+| `--unlimited --depth 1-4` | 47k → 113k | no cap; deeper combinatorics per level |
+| `--recall` | 2,596,456 | raw cross product (machine tier, never a quality claim) |
+
+Curated seeds are the *quality* dial: every word you add to `ADDITIONAL_SEEDS`,
+`NAME_WORDS`, `MEDICAL_WORDS`, `AGRI_WORDS`, `LAW_WORDS`, `MILITARY_WORDS`,
+`TRANSPORT_WORDS`, `TOOL_WORDS`, `BUSINESS_WORDS`, `RELIGION_WORDS` or
+`SCIENCE_WORDS` multiplies through the plural, gender, verb, compound and
+agentive stages automatically.
+
 ### Reporting a wrong or missing word
 
 Open an issue with `word`, `expected form`, and `section` — for example:
@@ -69,9 +84,17 @@ the default build free of junk like `کمآسان`.
 ## Tests before you push
 
 ```bash
-python build_urdu_database.py --verify --benchmark 10     # format + speed
-python build_urdu_database.py --exhaustive -o /tmp/x.gz  # large-lexicon path
+python build_urdu_database.py --verify --benchmark 10        # format + speed
+python build_urdu_database.py --exhaustive -o /tmp/x.gz      # gated expansion
+python build_urdu_database.py --unlimited --depth 2 -o /tmp/u.gz
 python -c "from build_urdu_database import UrduEngine; e=UrduEngine(); print(len(e), 'کمپیوٹر' in e)"
+```
+
+Rebuild the committed artifacts whenever you change seeds:
+
+```bash
+python build_urdu_database.py --verify --benchmark 5                       # default
+python build_urdu_database.py --unlimited --depth 4 -o urdu_database.full.txt.gz
 ```
 
 ## Assets

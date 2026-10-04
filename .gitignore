@@ -3,9 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# plain-text exports of the compiled database (rebuild with --export)
+# plain-text exports and machine-tier builds (rebuild with --export / --recall)
 /urdu_database.txt
-*.full.txt.gz
+*.recall.txt.gz
 
 # virtualenvs / packaging
 .venv/

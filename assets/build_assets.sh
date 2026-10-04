@@ -51,7 +51,7 @@ convert chipped.png \
   -font "$FONT_B" -fill "$WHITE" -pointsize 108 -kerning 1 -annotate +92+240 "urduofdani" \
   \( rule.png \) -geometry +94+282 -compose over -composite \
   -font "$FONT_B" -fill "$MUTED" -pointsize 22 -kerning 5 -annotate +94+336 "MODERN HIGH-SPEED URDU TEXT ENGINE" \
-  -font "$FONT_R" -fill "#8fa6c0" -pointsize 19 -kerning 3 -annotate +94+380 "10,812 WORDS      29.6 KB .GZ      ~1 MS LOAD      0 DEPENDENCIES" \
+  -font "$FONT_R" -fill "#8fa6c0" -pointsize 19 -kerning 3 -annotate +94+380 "24,589 WORDS      70.8 KB .GZ      ~2.4 MS LOAD      0 DEPENDENCIES" \
   -font "$FONT_B" -fill "$TEAL" -pointsize 20 -kerning 3 -annotate +112+429 "SINGLE-SPACE TOKENIZATION  x  GZIP LEVEL 9" \
   $STRIP banner.png
 
@@ -102,7 +102,7 @@ convert social-base.png social-scrim.png -compose over -composite \
   -stroke none \
   -font "$FONT_B" -fill "$WHITE" -pointsize 96 -kerning 1 -annotate +84+300 "urduofdani" \
   -font "$FONT_B" -fill "$MUTED" -pointsize 21 -kerning 5 -annotate +86+368 "MODERN HIGH-SPEED URDU TEXT ENGINE" \
-  -font "$FONT_R" -fill "#8fa6c0" -pointsize 21 -kerning 2 -annotate +86+414 "10,812 words  |  29.6 KB .gz  |  ~1 ms load  |  stdlib only" \
+  -font "$FONT_R" -fill "#8fa6c0" -pointsize 21 -kerning 2 -annotate +86+414 "24,589 words  |  70.8 KB .gz  |  ~2.4 ms load  |  stdlib only" \
   -font "$FONT_B" -fill "$TEAL" -pointsize 19 -kerning 3 -annotate +104+468 "SINGLE-SPACE TOKENIZATION  x  GZIP LEVEL 9" \
   $STRIP social-preview.png
 rm -f social-base.png social-scrim.png social-mask.png
