@@ -14,7 +14,7 @@
 # urduofdani
 ### Modern High-Speed Urdu Text Engine
 
-**25,320 curated + morphologically generated Urdu words in a 73.0 KB gzip binary (~2.9 ms load) — including the 99 names of Allah, the prophets, Ahl al-Bayt and the Sahaba — and up to 116,184 words in the unlimited build. No cap, no dependencies, no lag.**
+**15,848 audited Urdu words in a 43.9 KB gzip binary (~2.0 ms load) — every single token checked by a word audit that finds structural violations across the whole lexicon — including the 99 names of Allah, the prophets, Ahl al-Bayt and the Sahaba. Compact tier: the same words in 16.8 KB. Machine tier: 2,592,831 tokens. No cap, no dependencies, no lag.**
 
 <p>
   <a href="#4-quickstart-setup"><img src="https://img.shields.io/badge/QUICKSTART-2_minutes-14b8a6?style=for-the-badge&logo=gnometerminal&logoColor=white" alt="Quickstart"></a>
@@ -48,17 +48,18 @@
 
 | | |
 |---|---|
-| 🧠 **25,320 real Urdu words** | Curated across 34 domains + deterministic Urdu morphology (plurals, gender agreement, verb families, agentives, compounds) |
-| 🗜️ **73 KB instead of 356 KB** | One line, one space separator, gzip level 9 → **79.5% smaller** (85.7% on the unlimited build) |
-| ⚡ **~2.9 ms cold load** | Decompress + split + index 25,320 words in about one frame (15 ms for 116,184) |
+| 🧠 **15,848 audited Urdu words** | Curated across 34 domains + deterministic Urdu morphology (plurals, gender agreement, verb families, agentives, compounds) — audit: **0 structural violations, 0 junk classes** |
+| 🗜️ **43.9 KB instead of 107.8 KB** | One line, one space separator, gzip level 9 → **59.3% smaller**; the front-coded `compact` tier packs the same 15,848 words into **16.8 KB** |
+| ⚡ **~2.0 ms cold load** | Decompress + split + index 15,848 words in about one frame (6.5 ms for the compact tier) |
 | 🎯 **O(1) lookup / O(log n) autocomplete** | `set` membership + binary-search suggestions |
 | 🔤 **Arabic → Urdu smart folding** | `كِتاب`, `كتاب`, `کتاب` all resolve to one canonical word |
 | 🧩 **Zero dependencies** | Pure Python stdlib: `gzip`, `zlib`, `re`, `unicodedata` — no `pip install`, ever |
 | 🪟 **Windows-first engineering** | UTF-8 console, atomic writes, PyInstaller `--onefile` aware, no app freeze |
+| 🔬 **Word-audited** | `python tools/audit_words.py` checks every token (structural rules + regression lists) — the build fails if junk ever returns |
 | 🧾 **Reproducible artifacts** | Identical seeds ⇒ identical SHA-256 (verified in CI) |
-| 🧪 **Tested** | `python run_tests.py` → 60 tests covering orthography, morphology, sacred-name safety, the build, the engine and the CLI |
+| 🧪 **Tested** | `python run_tests.py` → 63 tests covering orthography, morphology, sacred-name safety, the word audit, the build, the engine and the CLI |
 | 🖥️ **One front door** | `python urduofdani.py info/build/verify/bench/search/check/suggest/export/random/test/modes` |
-| 🚀 **Unlimited mode** | `--unlimited --depth 4` = 116,184 words; `--recall` = 2,636,229 tokens |
+| 🚀 **Unlimited mode** | `--mode full` = 17,539 audited words; `--mode recall` = 2,592,831 tokens (machine tier) |
 | 🕌 **373 sacred names, protected** | The 99 names of Allah, the prophets, Ahl al-Bayt (including Hazrat Ali's family) and the Sahaba — **never pluralised, suffixed or compounded**, in any mode |
 
 ---
@@ -68,6 +69,7 @@
 1. [The Problem: MB-sized word lists and Windows app lag](#1-the-problem-mb-sized-word-lists-and-windows-app-lag)
 2. [The Solution: Single-Space Tokenization + Gzip](#2-the-solution-single-space-tokenization--gzip)
 3. [Real Benchmarks](#3-real-benchmarks)
+3b. [The Word Audit](#3b-the-word-audit-every-token-checked)
 4. [Quickstart (Setup)](#4-quickstart-setup)
 5. [Integration: Load `urdu_database.txt.gz` at Runtime](#5-integration-load-urdu_databasetxtgz-at-runtime)
 6. [Python API Reference](#6-python-api-reference)
@@ -92,7 +94,7 @@ A plain-text Urdu dictionary is expensive in three different ways:
 
 | Waste | Why it happens | Cost in a real app |
 |---|---|---|
-| **UTF-8 bloat** | Every Urdu letter (`ا`, `ب`, `پ`, `ٹ`, `ں`) costs **2 bytes** in UTF-8, plus 1 byte for every separator | This 25,320-word lexicon is **356.1 KB** of raw text; the 116,184-word unlimited build is **2.21 MB** |
+| **UTF-8 bloat** | Every Urdu letter (`ا`, `ب`, `پ`, `ٹ`, `ں`) costs **2 bytes** in UTF-8, plus 1 byte for every separator | This 15,848-word lexicon is **107.8 KB** of raw text; the machine tier is **34.6 MB** |
 | **Line / CSV parsing** | `readlines()`, `split(",")`, `csv.reader` allocate a new object per line and re-scan separators | Startup stalls of **hundreds of ms** on cold Windows disks |
 | **Disk + antivirus tax** | Thousands of small text files or one huge `.txt` is re-scanned by Windows Defender on every app start | Visible "**not responding**" flicker on the splash screen |
 
@@ -134,17 +136,17 @@ Urdu words share a huge amount of structure (common prefixes like `بے‑`, `ن
 356.1 KB  of raw single-line Urdu text
         │  gzip level 9 (DEFLATE) — standard .gz, readable by Python, Node, Java, .NET, 7-Zip
         ▼
- 73.0 KB  urdu_database.txt.gz        → 79.5% smaller
+ 43.9 KB  urdu_database.txt.gz        → 59.3% smaller
 ```
 
 * The container is a **standard gzip stream**, not a private format — `gzip`, `zcat`, `GZIPInputStream` (Java), `GZipStream` (.NET), `node:zlib` and `7-Zip` all open it.
 * The gzip header `MTIME` field is forced to `0`, so the build is **byte-for-byte reproducible** (same seeds → same SHA-256).
 * Writing is **atomic** (`tempfile` + `os.replace`), so a crash mid-write can never leave a corrupted database on disk.
-* Files go **from MBs to KBs**: the unlimited depth-4 build turns **2.21 MB → 323.2 KB (85.7%)**, and the ratio *improves* as the lexicon grows because morphemes repeat more often.
+* Files go **from MBs to KBs**: the depth-4 full build turns **121.2 KB → 48.1 KB (60.3%)**, and the front-coded compact tier reaches **16.8 KB (84.4%)**, and the ratio *improves* as the lexicon grows because morphemes repeat more often.
 
 ### Step 3 — Index once, serve instantly
 
-On startup the engine decompresses the 73 KB blob (~2.9 ms), splits it once, and builds a `set` + sorted `list` index. After that:
+On startup the engine decompresses the 44 KB blob (~2.0 ms; compact tier: 16.8 KB / 6.5 ms), splits it once, and builds a `set` + sorted `list` index. After that:
 
 * membership (`"کمپیوٹر" in engine`) is **O(1)**,
 * autocomplete (`engine.suggest("کم")`) is a **binary search — O(log n)**,
@@ -156,34 +158,87 @@ Measured on this repository's machine with `python tools/measure_tiers.py` (Pyth
 
 | tier | words | `.gz` size | saved | cold load | build |
 |---|---:|---:|---:|---:|---:|
-| `--mode mini` | 3,000 | 12.33 KB | 70.7% | 0.53 ms | 0.21 s |
-| `--mode default` | 25,320 | 72.98 KB | 79.5% | 3.70 ms | 0.29 s |
-| `--mode exhaustive` | 43,043 | 120.71 KB | 80.7% | 5.63 ms | 0.39 s |
-| `--mode wide` | 57,806 | 161.03 KB | 82.1% | 11.90 ms | 0.56 s |
-| `--mode full` | 116,184 | 323.17 KB | 85.7% | 17.16 ms | 1.25 s |
-| `--mode recall` | 2,636,229 | 7.10 MB | 89.2% | 498.92 ms | 33.6 s |
+| `--mode mini` | 3,000 | 11.36 KB | 44.3% | 0.62 ms | 0.21 s |
+| `--mode default` | 15,848 | 43.90 KB | 59.3% | 1.98 ms | 0.11 s |
+| `--mode exhaustive` | 16,243 | 45.05 KB | 59.4% | 2.61 ms | 0.15 s |
+| `--mode wide` | 16,875 | 46.72 KB | 59.6% | 2.61 ms | 0.18 s |
+| `--mode full` | 17,539 | 48.13 KB | 60.3% | 2.16 ms | 0.22 s |
+| `--mode recall` | 2,592,831 | 7.00 MB | 79.3% | 512.30 ms | 33.6 s |
 
 | Shipped artifact | Words | Raw payload (UTF-8) | Committed `.gz` | Saved | Cold load (best) | Peak RAM (loader) |
 |---|---|---|---|---|---|---|
-| `urdu_database.txt.gz` (default) | **25,320** | 356.1 KB | **73.0 KB** | **79.5%** | **2.9 ms** | 2.69 MB |
-| `urdu_database.full.txt.gz` (`--mode full`) | **116,184** | 2.21 MB | **323.2 KB** | **85.7%** | 14.7 ms | 13.59 MB |
+| `urdu_database.txt.gz` (default) | **15,848** | 107.8 KB | **43.9 KB** | **59.3%** | **2.0 ms** | 1.64 MB |
+| `urdu_database.compact.gz` (front-coded) | **15,848** | 107.8 KB | **16.8 KB** | **84.4%** | 6.5 ms | 2.1 MB |
+| `urdu_database.full.txt.gz` (`--mode full`) | **17,539** | 121.2 KB | **48.1 KB** | **60.3%** | 2.2 ms | 1.83 MB |
+| `urdu_database.full.compact.gz` (front-coded) | **17,539** | 121.2 KB | **18.0 KB** | **85.1%** | 7.4 ms | 2.3 MB |
 
-| Stage | Default (25.3k) | Full (116.2k) | Recall (2.6M) |
+| Stage | Default (15.8k) | Full (17.5k) | Recall (2.6M) |
 |---|---|---|---|
-| Compile lexicon (morphology = all the CPU work) | **0.14 s** | 0.62 s | ~28 s |
-| Compress + write `.gz` | **0.07 s** | 0.37 s | ~5 s |
-| **Total (in-process)** | **0.21 s** | **0.98 s** | ~33 s |
+| Compile lexicon (morphology = all the CPU work) | **0.11 s** | 0.15 s | ~28 s |
+| Compress + write `.gz` | **0.05 s** | 0.07 s | ~5 s |
+| **Total (in-process)** | **0.16 s** | **0.22 s** | ~33 s |
 | Total including Python startup | ~0.25 s | ~1.03 s | — |
 
 > **Memory note.** The builder holds the lexicon in RAM while de-duplicating and
 > sorting, so peak RSS scales with the token count: ~120 MB for 116k words,
 > ~500 MB for the 2.6M-token recall tier. The shipped builds stay far below that.
 
-> **Why the ratio keeps climbing:** DEFLATE pays off with repetition, and Urdu
-> morphology is *extremely* repetitive (‑وں، ‑یں، ‑دار، ‑مند، ‑خانہ). The 25.3k
-> default build saves **79.5%**, the 116k unlimited build **85.7%**, and the
-> 2.6M-token recall tier **89.2%**. A 70 KB file is smaller than one JPEG icon and
-> loads in about the time one frame takes to render.
+> **Why the ratio tracks quality:** DEFLATE pays off with repetition, and a
+> clean lexicon repeats far less than a noisy one — the audited default build
+> saves **59.3%**, while the *front-coded* compact tier reaches **84.4%** on the
+> same 15,848 words and the 2.6M-token recall tier saves **79.3%**. 16.8 KB–43.9 KB
+> is smaller than one JPEG icon, and it loads in about the time one frame takes to
+> render.
+
+## 3b. The Word Audit: every token checked
+
+Big word lists are easy; *correct* word lists are not. Earlier builds were larger
+because the generator glued morphemes together blindly. `tools/audit_words.py`
+now reads **every token of a shipped tier** and fails the build on anything a real
+Urdu word never does:
+
+| layer | what it checks |
+|---|---|
+| structural rules | presentation-form codepoints, medial `آ`, impossible 5+ consonant runs, doubled plural markers (`بازؤنوں`), a derivational suffix on an already-inflected stem (`جوتوںی`), repeated agentive tails (`فنکارگر`), stray diacritics |
+| regression lists | ~55 real words that **must** be present and ~60 junk tokens that must **never** appear in any tier — every bug the audit ever found is pinned here |
+| fluency queue | an informational bigram score that ranks odd tokens for human review (never a hard gate: it also dislikes rare-but-real words like `آؤ`) |
+
+Run it yourself:
+
+```bash
+python tools/audit_words.py            # the shipped default tier
+python tools/audit_words.py --full     # the full tier
+python tools/audit_words.py --queue 25 # show the human-review queue
+```
+
+Current result — both tiers:
+
+```text
+urduofdani :: word audit - urdu_database.txt.gz
+====================================================================
+  tokens               : 15,848
+  structural violations: 0
+  missing real words   : none
+  junk still present   : none
+====================================================================
+[audit_words] PASS  (every structural rule and regression list is clean)
+```
+
+### What the audit found and removed
+
+| # | bug class | examples the audit caught | fix |
+|---|---|---|---|
+| 1 | **blind head attachment** — `خانہ/گاہ/دکان/منڈی` were glued to whole sections | `آلوخانہ`, `آنکھگاہ`, `آلودگیگودام`, `اجرتمنڈی` | every head has a curated host list (`HEAD_HOSTS`), same idea as the agentive hosts |
+| 2 | **blind agentive cross product** — 226 stems × 10 suffixes | `اسٹیڈیمفروش`, `آبپاشیدان`, `اخبارساز`, `انجندان` | curated per-suffix host tables (`AGENTIVE_SUFFIX_HOSTS`) |
+| 3 | **silent phrase fusion** — a spaced seed was fused into one token | `اٹھائی والا → اٹھائیوالا`, `صافکرنےوالا` | fusion is allowed only inside hand-written banks; generators can never fuse |
+| 4 | **verb banks that were not verbs** — infinitives and nouns listed as roots | `آرامنےوالا`, `کامنا`, `آرامتا` | roots are repaired (`ابھرنا → ابھر`) or refused (`NON_VERB_ROOTS`) |
+| 5 | **noun sections wearing adjective suffixes** | `گردنپن`, `ہڑتالگی`, `کمانڈرپن`, `کمانڈرناک` | a section may only use the morphology its own rule allows |
+| 6 | **sacred names stored inflected** — the Anbiya bank itself listed `نبیوں` / `پیغمبروں` | plural forms of prophets "protected" by the never-inflect guard | inflected entries removed; the guarantee is now tested for every name × 8 markers |
+
+The 2,000+ real words a strict guard would have deleted are kept in curated tables
+with their reasons written down (`KEEP_FORMS`, `LOAN_PLURAL_HOSTS`, the place-head
+whitelist) — that is how `چائےخانہ`, `اسٹیشنز`, `کمپیوٹرز` and `کتابدار` survive a
+strict audit.
 
 ## 4. Quickstart (Setup)
 
@@ -211,18 +266,18 @@ python build_urdu_database.py
 Expected output (abridged — the compiler reports every section):
 
 ```text
-[urduofdani] lexicon compiled in 0.145s
+[urduofdani] lexicon compiled in 0.111s
     + 1_curated                     3,722
     + 2_tech                          931
-    + 7_verb_forms                  5,243
-    + 9_compounds                   6,721
-    + 9b_agentives                  2,028
-    = TOTAL                        25,320 unique Urdu words
+    + 7_verb_forms                  5,065
+    + 9_compounds                      89
+    + 9b_agentives                    167
+    = TOTAL                        15,848 unique Urdu words
 [urduofdani] wrote urdu_database.txt.gz
-    raw      : 356.09 KB
-    gzip     : 72.98 KB  (79.5% smaller)
-    io time  : 0.083s
-    sha256   : 7c21497c2477910a4beec7e739f88aef5c97808c02eecaa1e1162f67936e643b
+    raw      : 107.75 KB
+    gzip     : 43.90 KB  (59.3% smaller)
+    io time  : 0.050s
+    sha256   : d1081d60509e760d...   (rebuild it: the build is deterministic)
 ```
 
 ### Step 3 — Verify the artifact (recommended)
@@ -233,13 +288,13 @@ python urduofdani.py verify --export urdu_database.txt
 
 ```text
 [urduofdani] verifying urdu_database.txt.gz
-    [PASS] gzip readable      74683 bytes packed payload
+    [PASS] gzip readable      44954 bytes packed payload
     [PASS] sacred names intact 373 present, 0 inflected
     [PASS] no newline         single line
     [PASS] no comma           comma-free
     [PASS] no digits          digit-free
-    [PASS] non-empty database 25320 tokens
-    [PASS] no duplicates      25320 tokens / 25320 unique
+    [PASS] non-empty database 15848 tokens
+    [PASS] no duplicates      15848 tokens / 15848 unique
     [PASS] all tokens legal   100% Urdu letters
 ```
 
@@ -253,13 +308,13 @@ See [Section 5](#5-integration-load-urdu_databasetxtgz-at-runtime).
 ### Optional — build the massive variants
 
 ```bash
-# 116,184 words / 323 KB - the shipped "full" build (already in this repo)
+# 17,539 words / 48 KB - the shipped "full" build (already in this repo)
 python urduofdani.py build --mode full -o urdu_database.full.txt.gz
 
-# 43,043 words - compounds + agentives + affix families, quality-gated
+# 16,243 words - compounds + agentives + affix families, quality-gated
 python urduofdani.py build --mode exhaustive
 
-# 2,636,229 tokens / 7.1 MB - raw maximum recall, machine-oriented
+# 2,592,831 tokens / 7.0 MB - raw maximum recall, machine-oriented
 python urduofdani.py build --mode recall -o urdu_database.recall.txt.gz
 ```
 
@@ -268,16 +323,21 @@ python urduofdani.py build --mode recall -o urdu_database.recall.txt.gz
 | Mode | Words | What it adds | Quality |
 |---|---|---|---|
 | `--mode mini` | 3,000 | a small, fast subset for embedded / low-RAM targets | ✅ hand-verified vocabulary |
-| `--mode default` | 25,320 | seeds + plurals + gender + verb families + compounds + curated agentives + 373 sacred names | ✅ hand-verified vocabulary |
-| `--mode exhaustive` | 43,043 | section-gated affix families, prefix hosts | ✅ high |
-| `--mode wide` | 57,806 | relational `-ی`, `والا` family, plural+`والا`, market heads | ✅ high |
-| `--mode full` | 116,184 | second suffix layer, two-head compounds (the shipped `.full`) | ⚠️ recall tier |
-| `--mode recall` | 2,636,229 | full prefix × root × suffix × head cross product | ⚠️ machine only |
+| `--mode default` | 15,848 | seeds + plurals + gender + verb families + curated compounds/agentives + 373 sacred names | ✅ **word-audited, 0 violations** |
+| `--mode exhaustive` | 16,243 | section-gated affix families, prefix hosts | ✅ word-audited |
+| `--mode wide` | 16,875 | relational `-ی`, the curated `والا` family, plural+`والا`, market heads | ✅ word-audited |
+| `--mode full` | 17,539 | the wide ladder plus the depth-4 derivations that survive the audit | ✅ word-audited |
+| `--mode recall` | 2,592,831 | full prefix × root × suffix × head cross product | ⚠️ machine only (raw by design) |
 
 > `--unlimited` never caps the lexicon (`--max-words 0`), and `--depth` controls how
 > far the combinatorial ladder goes. Every emitted token is still **letter-legal
 > Urdu** (no digits, no Latin, no punctuation) — which is exactly what a
 > spell-checker or "did you mean…" engine needs.
+>
+> The audited tiers shrank when the word audit ran: the old 25k/116k numbers came
+> from blind section-wide glue (`آلوخانہ`, `اسٹیڈیمفروش`, `آرامنےوالا`) that a real
+> Urdu speaker would never call a word. Quality first: the machine tier still gives
+> you 2.59 M tokens when you want raw recall.
 
 ## 5. Integration: Load `urdu_database.txt.gz` at Runtime
 
@@ -292,7 +352,7 @@ def load_urdu_database(path: str = "urdu_database.txt.gz") -> list[str]:
         payload = fh.read().decode("utf-8")
     return payload.split(" ") if payload else []
 
-WORDS = load_urdu_database()        # e.g. 25,320 words - takes ~2.9 ms
+WORDS = load_urdu_database()        # e.g. 15,848 words - takes ~2.0 ms
 LOOKUP = set(WORDS)                 # O(1) membership
 print(len(WORDS), "کمپیوٹر" in LOOKUP)
 ```
@@ -401,7 +461,7 @@ def main() -> int:
             pass
 
     root = tk.Tk()
-    engine = UrduEngine()            # auto-locates urdu_database.txt.gz, ~2.9 ms
+    engine = UrduEngine()            # auto-locates urdu_database.txt.gz, ~2.0 ms
     UrduAutocompleteApp(root, engine)
     root.mainloop()
     return 0
@@ -428,7 +488,7 @@ from flask import Flask, jsonify, request
 from build_urdu_database import UrduEngine
 
 app = Flask(__name__)
-engine = UrduEngine()                      # loaded ONCE at import time (~2.9 ms)
+engine = UrduEngine()                      # loaded ONCE at import time (~2.0 ms)
 
 @app.get("/suggest")
 def suggest():
@@ -447,7 +507,7 @@ def check():
 from build_urdu_database import (
     UrduEngine,          # runtime dictionary: lookup, autocomplete, search
     build_urdu_database, # compile + write urdu_database.txt.gz
-    load_urdu_database,  # -> list[str]   (whole DB, ~2.9 ms)
+    load_urdu_database,  # -> list[str]   (whole DB, ~2.0 ms)
     iter_urdu_words,     # -> Iterator[str] (constant memory, huge DBs)
     verify_database,     # integrity checks (.gz, single line, no dupes)
     benchmark,           # load timings in milliseconds
@@ -482,12 +542,13 @@ python build_urdu_database.py [options]
 |---|---|---|
 | `-o`, `--output PATH` | `urdu_database.txt.gz` | Output gzip path. |
 | `-m`, `--max-words N` | `0` | Cap the lexicon. **`0` = unlimited** (keep everything). Sampling is spread across the alphabet, not truncated. |
-| `--exhaustive` | off | Maximum-recall combinatorial expansion (43,043 words, 80.7% compression). |
+| `--exhaustive` | off | Section-gated affix families (16,243 audited words). |
 | `--unlimited` | off | No cap at all — keep every generated token (pair with `--depth`). |
 | `--depth {1,2,3,4}` | `2` | How far the combinatorial ladder climbs under `--unlimited`/`--recall` (4 = largest). |
-| `--recall` | off | Raw maximum-recall cross product (2,636,229 tokens, machine-oriented). |
+| `--recall` | off | Raw maximum-recall cross product (2,592,831 tokens, machine-oriented). |
 | `--min-len` / `--max-len` | `2` / `40` | Token length window. |
 | `--keep-diacritics` | off | Keep harakat (`اَ`) instead of folding them. |
+| `--format {plain,compact}` | `plain` | Payload layout: `plain` = one space-separated line (fastest); `compact` = front-coded, ~2.6× smaller gz (16.8 KB vs 43.9 KB) for ~4.5 ms more load time. |
 | `--verify` | off | Run the 8 integrity checks after building. |
 | `--export TXT` | – | Also write the plain single-line `.txt`. |
 | `--benchmark [N]` | – | Benchmark N decompression runs. |
@@ -500,7 +561,7 @@ Common invocations:
 ```bash
 python build_urdu_database.py                                  # recommended build
 python build_urdu_database.py --verify --benchmark 10          # build + prove + measure
-python build_urdu_database.py --exhaustive                     # 43,043-word quality expansion
+python build_urdu_database.py --exhaustive                     # 16,243-word quality expansion
 python build_urdu_database.py --unlimited --depth 4 -o urdu_database.full.txt.gz
 python build_urdu_database.py --recall -o urdu_database.recall.txt.gz
 python build_urdu_database.py --no-build --benchmark 5         # measure an existing .gz only
@@ -568,12 +629,13 @@ python run_tests.py -k sacred   # only tests whose name matches
 | `examples/autocomplete_app.py` | A complete Tkinter autocomplete app (Windows-ready, `--list` for headless checks, PyInstaller recipe in the header). |
 | `tools/measure_tiers.py` | Builds every tier and prints the benchmark table; `--check README.md` fails if the docs go stale. |
 | `tools/audit_docs.py` | Documentation audit: anchors, links, word-count claims, documented CLI surface. |
+| `tools/audit_words.py` | **Word audit**: structural rules + regression lists over every shipped token (`--full` audits the full tier). |
 
 ```
 
 ## 8. Dictionary Coverage
 
-**34 domain sections** · 6,222 curated seeds · 260 verb roots · 375 protected sacred names
+**34 domain sections** · 5,188 curated entries · 259 verb roots · 373 protected sacred names
 
 
 | Section | Examples | Morphology applied |
@@ -618,10 +680,10 @@ python run_tests.py -k sacred   # only tests whose name matches
 
 **Two build modes**
 
-* **`--mode default`** — every rule is gated by real Urdu phonology and by hand-written host sets: `بے` only attaches to bases that truly take it (`بےکار`, `بےنام`, `بےوفا`), agentive suffixes (`دار`, `فروش`, `ساز`) only to the curated host stems, market heads (`منڈی`, `بازار`, `گودام`) only to the sections where they are idiomatic. Result: **25,320** clean tokens.
-* **`--mode exhaustive` / `--mode wide`** — section-gated affix families and relational forms: **43,043** / **57,806** tokens, still quality-gated.
-* **`--mode full`** — no cap, `--depth 4`: **116,184** tokens while staying letter-legal.
-* **`--mode recall`** — the unfiltered cross product: **2,636,229** machine-oriented tokens for spell-correction and fuzzy search.
+* **`--mode default`** — every rule is gated by real Urdu phonology and by hand-written host sets: `بے` only attaches to bases that truly take it (`بےکار`, `بےنام`, `بےوفا`), agentive suffixes (`دار`, `فروش`, `ساز`) only to the curated host stems, market heads (`منڈی`, `بازار`, `گودام`) only to the curated host stems. Result: **15,848** clean tokens.
+* **`--mode exhaustive` / `--mode wide`** — section-gated affix families and relational forms: **16,243** / **16,875** tokens, still quality-gated.
+* **`--mode full`** — no cap, `--depth 4`: **17,539** tokens, all of them audited.
+* **`--mode recall`** — the unfiltered cross product: **2,592,831** machine-oriented tokens for spell-correction and fuzzy search.
 
 ## Sacred Names (Protected)
 
@@ -665,11 +727,11 @@ Verified across every tier (build is deterministic, so these numbers are reprodu
 | Mode | Tokens | Sacred names present | Inflected sacred names |
 |---|---|---|---|
 | `--mode mini` | 3,000 | 373 / 373 | **0** |
-| `--mode default` | 25,320 | 373 / 373 | **0** |
-| `--mode exhaustive` | 43,043 | 373 / 373 | **0** |
-| `--mode wide` | 57,806 | 373 / 373 | **0** |
-| `--mode full` | 116,184 | 373 / 373 | **0** |
-| `--mode recall` | 2,636,229 | 373 / 373 | **0** |
+| `--mode default` | 15,848 | 373 / 373 | **0** |
+| `--mode exhaustive` | 16,243 | 373 / 373 | **0** |
+| `--mode wide` | 16,875 | 373 / 373 | **0** |
+| `--mode full` | 17,539 | 373 / 373 | **0** |
+| `--mode recall` | 2,592,831 | 373 / 373 | **0** |
 
 ### Using them at runtime
 
@@ -680,7 +742,7 @@ same fast path — and behave like any other dictionary word:
 from build_urdu_database import UrduEngine, SACRED_NAMES
 
 engine = UrduEngine()
-print(len(SACRED_NAMES))                      # 375
+print(len(SACRED_NAMES))                      # 373
 print("اللہ" in engine, "محمد" in engine, "فاطمہ" in engine)   # True True True
 print(engine.suggest("علی", 5))               # ['علی', 'علیم', 'علیحدہ', ...]
 print("اللہوں" in engine)                     # False  <- never generated
@@ -839,7 +901,7 @@ The container (single-line + gzip + atomic write) is language-agnostic: point `-
 <details>
 <summary><b>What's the actual bottleneck?</b></summary>
 
-Morphology generation — the "compile every variant" step: 0.14 s for the default 25.3k build, 0.98 s for the 116.2k full build, ~33 s for the 2.6M recall tier. Decompression is essentially free (2.9 ms) and happens once per process.
+Morphology generation — the "compile every variant" step: 0.11 s for the default 15.8k build, 0.15 s for the 17.5k full build, ~33 s for the 2.6M recall tier. Decompression is essentially free (2.0 ms) and happens once per process.
 </details>
 
 <details>
@@ -888,8 +950,10 @@ plural, gender, verb, compound and agentive stages automatically.
 urduofdani-dictionary/
 ├── urduofdani.py              # the front door: info/build/verify/bench/search/check/…
 ├── build_urdu_database.py     # the whole engine: compiler + runtime + CLI (stdlib only)
-├── urdu_database.txt.gz       # default database (25,320 words / 73.0 KB)
-├── urdu_database.full.txt.gz  # unlimited build (116,184 words / 323.2 KB)
+├── urdu_database.txt.gz       # default database (15,848 audited words / 43.9 KB)
+├── urdu_database.compact.gz   # front-coded twin (15,848 words / 16.8 KB, ~6.5 ms)
+├── urdu_database.full.txt.gz  # full build (17,539 words / 48.1 KB)
+├── urdu_database.full.compact.gz  # front-coded full tier (17,539 words / 18.0 KB)
 ├── run_tests.py               # test runner (verbosity + -k pattern filters)
 ├── tests/test_urduofdani.py   # 60 tests: orthography, morphology, sacred names, build, CLI
 ├── examples/                  # quickstart tour + Tkinter autocomplete app
@@ -916,8 +980,8 @@ After `--export` / `--recall` runs you may also see `urdu_database.txt` (plain s
 
 The full plan — including the audit protocol this project is maintained with — lives in [ROADMAP.md](ROADMAP.md); the release history lives in [CHANGELOG.md](CHANGELOG.md).
 
-* [x] **Single-space tokenization + gzip** — 25,320 words in 73 KB, 2.9 ms cold load
-* [x] **Unlimited builds** — no cap, depth-controlled expansion (`--mode full` = 116,184 words)
+* [x] **Single-space tokenization + gzip** — 15,848 audited words in 43.9 KB, 2.0 ms cold load
+* [x] **Unlimited builds** — no cap, depth-controlled expansion (`--mode recall` = 2,592,831 tokens)
 * [x] **30+ domain sections** with per-section morphology rules and curated host gates
 * [x] **373 sacred names** (Allah · Anbiya · Ahl al-Bayt · Sahaba) with a never-inflect guarantee
 * [x] **Front door, tests, CI, reproducible builds** — `urduofdani.py`, 60 tests, byte-identical artifacts

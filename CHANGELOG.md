@@ -4,6 +4,74 @@ All notable changes to **urduofdani** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] — 2026-10-04
+
+**The word audit round.** Every token in both shipped tiers is now checked by
+`tools/audit_words.py`, and the whole lexicon was rebuilt from what it found.
+
+### Added
+
+* **`tools/audit_words.py`** — three layers over every token: structural rules
+  (presentation-form codepoints, medial `آ`, 5+ consonant runs, doubled plural
+  markers, suffix-on-inflected-stem, repeated agentive tails, stray diacritics),
+  curated regression lists (~55 real words that must exist, ~60 junk tokens that
+  must never appear) and an informational fluency queue. It is gate #4 of
+  `python urduofdani.py audit`, so junk cannot come back unnoticed.
+* **`urduofdani_engine.py`** — a stdlib-only, drop-in engine artifact
+  (`UrduEngine`, `find_database`, `read_database`, `canonical`, `FALLBACK_WORDS`)
+  with a CLI (`--info/--bench/--check/--suggest/--spell`). It auto-detects the
+  compact tier and never lags: ~9 ms cold load on the 15,848-word compact build.
+* **Compact front-coded tier** — `--format compact` writes
+  `urdu_database.compact.gz` (15,848 words in **16.8 KB** vs 43.9 KB plain, ~6.5 ms
+  load) and `urdu_database.full.compact.gz` (17,539 words / 18.0 KB). The codec is
+  `URDUFC1 <count> <sha16>` + base-36 shared-prefix entries, checksum-enforced.
+* Compiled-in curated tables with their reasons written down: `HEAD_HOSTS`,
+  `AGENTIVE_SUFFIX_HOSTS`, `LOAN_PLURAL_HOSTS`, `KEEP_FORMS`, `NON_VERB_ROOTS`.
+* `tests` grew to 63: word-audit regression tests (junk classes, real-word
+  survival, sacred-name invariant, loan plurals) plus the earlier suites.
+
+### Changed
+
+* **Honest counts.** The audit proved that a large share of the old builds was
+  generated glue, so the numbers moved: default **25,320 → 15,848** audited words
+  (43.9 KB, 2.0 ms), full **116,184 → 17,539** (48.1 KB), recall 2,592,831.
+  Nothing was removed for being rare — only for being unbuildable as a real word.
+* **Structural rules are morpheme-aware.** Long consonant runs and medial `آ` are
+  judged after checking the token is a curated seed or a real morpheme chain, so
+  `آرکسٹرا`, `ابنمسعود`, `برکتمندوں`, `قرآن` pass while generator glue still fails.
+* `--mode` blurbs, README, badges and the regenerated raster assets all report the
+  measured numbers.
+
+### Fixed
+
+* **Blind head attachment** — `خانہ/گاہ/دکان/منڈی/بازار/گودام/میدان/اڈہ/کھیت` were
+  glued onto whole sections (`آلوخانہ`, `آنکھگاہ`, `آلودگیگودام`, `اجرتمنڈی`,
+  `آرڈرمنڈی`). Each head now has a curated host list (89 real compounds).
+* **Blind agentive cross product** — 226 stems × 10 suffixes produced
+  `اسٹیڈیمفروش`, `آبپاشیدان`, `اخبارساز`, `انجندان`, `بلبفروش`. Curated per-suffix
+  host tables replace the product.
+* **Silent phrase fusion** — `_add()` fused any spaced input (`"اٹھائی والا"` →
+  `اٹھائیوالا`, `صافکرنےوالا`). Fusion is now allowed only inside hand-written
+  banks; generators can never fuse.
+* **Verb banks that were not verbs** — infinitives and nouns listed as roots minted
+  `آرامنےوالا`, `آرامنا`, `کامنا`, `یادنا`, `سپردتا`, `مستردتا`. Roots are repaired
+  (`ابھرنا → ابھر`, `بڑبڑ → بڑبڑا`) or refused.
+* **Noun sections wearing adjective suffixes** — `گردنپن`, `ہڑتالگی`, `کمانڈرپن`,
+  `کمانڈرناک` are gone; a section may only use its own rule's morphology.
+* **`ہ`-final plurals** — `بندرگاہ` gave `بندرگاے`/`بندرگاوں`; vowel-`ہ` stems now
+  keep the `ہ` (`بندرگاہیں`, `بندرگاہوں`) while consonant-`ہ` stems still elide it
+  (`کمرے`, `کمروں`).
+* **Real words restored** after the guards got strict: `کتابدار`, `گنگنانا`,
+  `دربان`, `گلدان`, `عجائبگھر`, `اسٹیشنز`, `کمپیوٹرز`, `موبائلز`, `ٹکٹس`, `پنکھا`
+  family derivations and the place compounds (`مہمانخانہ`, `ورزشگاہ`, `تفریحگاہ`,
+  `عبادتگاہ`, `شکارگاہ`, `زیارتگاہ`, `سبزیمنڈی`, `مچھلیمنڈی`, `اناجگودام`).
+* **Sacred-name guarantee completed** — the Anbiya bank itself listed the inflected
+  `نبیوں` / `پیغمبروں`, which the never-inflect guard then protected. Inflected
+  entries removed (387 entries → 373 unique canonical names) and the invariant is
+  tested for every name × 8 markers.
+* **`--mode exhaustive/wide/full`** no longer stack two compound heads
+  (`انجینئرگھرگر`, `ریتسازفروش`) or stack suffixes on loanwords.
+
 ## [3.0.0] — 2026-10-04
 
 ### Added

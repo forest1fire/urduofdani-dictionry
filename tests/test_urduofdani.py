@@ -422,8 +422,46 @@ class TestShippedArtifacts(unittest.TestCase):
     @unittest.skipUnless(SHIPPED.exists(), "shipped database missing")
     def test_shipped_db_size_and_words(self):
         words = core.load_urdu_database(SHIPPED)
-        self.assertGreater(len(words), 20000)
+        # A *quality band*: the audit-driven clean-up removed ~8k junk tokens, so
+        # the floor is deliberately a real-word floor, not a raw-volume floor.
+        self.assertGreater(len(words), 15000)
         self.assertLess(SHIPPED.stat().st_size, 200 * 1024)
+
+    @unittest.skipUnless(SHIPPED.exists(), "shipped database missing")
+    def test_full_audit_quality_round_kept_the_junk_out(self):
+        """Every class of junk the word audit found must stay gone."""
+        words = set(core.load_urdu_database(SHIPPED))
+        for junk in ("آلوخانہ", "آنکھگاہ", "آلودگیگاہ", "آبپاشیگودام", "اجرتمنڈی",
+                     "آرڈرمنڈی", "اسٹیڈیمفروش", "آبپاشیدان", "اخبارساز", "بلبفروش",
+                     "اسٹیڈیمساز", "اٹھاائیوالا", "بوناائیوالا", "صافکرنےوالا",
+                     "ضدکرنےوالا", "آرامنےوالا", "آرامنا", "کامنا", "یادنا",
+                     "انجینئرگھرگر", "ریتسازفروش", "کمانڈرپن", "گردنپن", "ہڑتالگی"):
+            self.assertNotIn(junk, words, "%s should not be a word" % junk)
+
+    @unittest.skipUnless(SHIPPED.exists(), "shipped database missing")
+    def test_full_audit_quality_round_kept_the_real_words(self):
+        words = set(core.load_urdu_database(SHIPPED))
+        for real in ("چائےخانہ", "دواخانہ", "ڈاکخانہ", "کتابخانہ", "مہمانخانہ",
+                     "ورزشگاہ", "تفریحگاہ", "عبادتگاہ", "شکارگاہ", "زیارتگاہ",
+                     "سبزیمنڈی", "مچھلیمنڈی", "اناجگودام", "دودھفروش", "مچھلیفروش",
+                     "کتابفروش", "زیورساز", "گھڑیساز", "عقلمند", "دردمند", "خدمتکار",
+                     "دربان", "قلمدان", "نمکدان", "ابھرنا", "کرنےوالا", "اٹھانےوالا",
+                     "اسٹیشنز", "کمپیوٹرز", "موبائلز", "ٹکٹس"):
+            self.assertIn(real, words, "%s must be in the build" % real)
+
+    @unittest.skipUnless(SHIPPED.exists(), "shipped database missing")
+    def test_sacred_names_are_never_inflected_anywhere(self):
+        """Phase-4 guarantee: names in the four protected sections stay bare."""
+        words = set(core.load_urdu_database(SHIPPED))
+        markers = ("وں", "یں", "اں", "ات", "ے", "ؤں", "پن", "گی")
+        for name in core._sacred_set():
+            if name in core.SACRED_HOMOGRAPH_STEMS:
+                continue
+            for marker in markers:
+                variant = name + marker
+                if variant in core.SACRED_DERIVATIVE_EXCEPTIONS:
+                    continue
+                self.assertNotIn(variant, words, "%s must never be derived" % variant)
 
     @unittest.skipUnless(FULL.exists(), "unlimited build missing")
     def test_full_db_is_valid_and_bigger(self):

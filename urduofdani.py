@@ -44,17 +44,17 @@ FULL_DB = "urdu_database.full.txt.gz"
 
 MODES = {
     "mini": dict(max_words=3000, exhaustive=False, unlimited=False, depth=2,
-                 blurb="~3k words - embedded / low-RAM targets (a few KB)"),
+                 blurb="3k words / 11.4 KB - embedded / low-RAM targets"),
     "default": dict(max_words=0, exhaustive=False, unlimited=False, depth=2,
-                    blurb="~25k words - curated + gated morphology (recommended)"),
+                    blurb="15.8k audited words / 43.9 KB - the shipped build (recommended)"),
     "exhaustive": dict(max_words=0, exhaustive=True, unlimited=False, depth=2,
-                       blurb="~42k words - section-gated affix families"),
+                       blurb="16.2k words - section-gated affix families"),
     "wide": dict(max_words=0, exhaustive=True, unlimited=True, depth=2,
-                 blurb="~57k words - relational forms, والا family, market heads"),
+                 blurb="16.9k words - relational forms, curated والا family, market heads"),
     "full": dict(max_words=0, exhaustive=True, unlimited=True, depth=4,
-                 blurb="~114k words - deep combinatorics (the shipped .full build)"),
+                 blurb="17.5k audited words / 48.1 KB - the shipped .full build"),
     "recall": dict(max_words=0, exhaustive=True, unlimited=True, depth=2, recall=True,
-                   blurb="~2.6M tokens - raw cross product, machine tier only"),
+                   blurb="2.59M tokens / 7.0 MB - raw cross product, machine tier only"),
 }
 
 
@@ -216,9 +216,12 @@ AUDIT_GATES = (
     ("tests", "run_tests.py", ["--quiet"]),
     ("verify default", "urduofdani.py", ["verify"]),
     ("verify full", "urduofdani.py", ["verify", "--full"]),
+    ("word audit", "tools/audit_words.py", []),
+    ("word audit full", "tools/audit_words.py", ["--full"]),
     ("docs", "tools/audit_docs.py", []),
     ("tier table", "tools/measure_tiers.py", ["--check", "README.md"]),
     ("examples", "examples/quickstart.py", []),
+    ("gui example", "examples/autocomplete_app.py", ["--list"]),
 )
 
 
@@ -248,7 +251,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print("  details: rerun the failing tool directly, e.g. python %s"
               % next(e[1] for e in AUDIT_GATES if e[0] == failures[0]))
         return 1
-    print("  all %d gates passed - tests, artifacts, docs, tier table, examples" % len(AUDIT_GATES))
+    print("  all %d gates passed - tests, word audit, artifacts, docs, tiers, examples"
+          % len(AUDIT_GATES))
     return 0
 
 
@@ -258,8 +262,8 @@ def cmd_modes(args: argparse.Namespace) -> int:
     for name, spec in MODES.items():
         print("  %-11s %s" % (name, spec["blurb"]))
     _rule()
-    print("  python urduofdani.py build --mode full      # the 116k build")
-    print("  python urduofdani.py build --mode recall    # 2.6M-token machine tier")
+    print("  python urduofdani.py build --mode full      # the 17.5k audited build")
+    print("  python urduofdani.py build --mode recall    # 2.59M-token machine tier")
     print("  python urduofdani.py modes                  # this list")
     return 0
 

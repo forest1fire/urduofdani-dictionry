@@ -79,7 +79,7 @@ __all__ = [
     "compile_lexicon",
 ]
 
-SCRIPT_VERSION = "3.0.0"
+SCRIPT_VERSION = "3.1.0"
 DB_FILENAME = "urdu_database.txt.gz"
 SEPARATOR = " "
 GZIP_LEVEL = 9            # maximum deflate ratio: this is what collapses MB -> KB
@@ -121,9 +121,10 @@ _FOLD_TABLE = str.maketrans({chr(k): v for k, v in _FOLD_MAP.items()})
 _HARAKAT = re.compile(r"[\u064B-\u0650\u0652-\u0653\u0656-\u065F\u0670\u06D6-\u06ED]")
 
 # A token that is legal AFTER cleaning. Rejects digits and punctuation.
-_LEGAL_TOKEN = re.compile(
-    r"^[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF\u200C\u200D]+$"
-)
+# NOTE: the Arabic Presentation Forms blocks (U+FB50-FDFF, U+FE70-FEFF) are
+# explicitly excluded - those codepoints are isolated/initial/final glyph shapes,
+# not text. U+FE85 ("ﺅ") must never reach the database; NFKC folds it to U+0624.
+_LEGAL_TOKEN = re.compile(r"^[\u0600-\u06FF\u0750-\u077F]+$")
 _FORBIDDEN = re.compile(r"[0-9\u0660-\u0669\u06F0-\u06F9]")
 _PUNCT = re.compile(
     r"[\s,.;:!?،؛؟٪%\-_/\\|@#$^&*+=~`'\"()\[\]{}<>«»…\u2009\u2026\u060C\u061B\u061F]"
@@ -131,6 +132,11 @@ _PUNCT = re.compile(
 
 # Urdu letters that behave like vowels when an affix is attached.
 _VOWEL_FINALS = "اآہیےوؤ"
+
+
+def fold_seed(word: str) -> str:
+    """Fold one seed word (NFKC + look-alike table) without stripping harakat."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFKC", word).translate(_FOLD_TABLE)).strip()
 
 
 def canonicalize(word: str, keep_diacritics: bool = False) -> str:
@@ -141,7 +147,10 @@ def canonicalize(word: str, keep_diacritics: bool = False) -> str:
     """
     if not word:
         return ""
-    word = unicodedata.normalize("NFC", word).translate(_FOLD_TABLE)
+    # NFKC first: it folds the Arabic Presentation Forms (U+FE85 "ﺅ" -> U+0624 "ؤ",
+    # the ﻻ ligature -> لا, ...) so a seed typed with a glyph shape cannot leak
+    # into the artifact as an untypeable token.
+    word = unicodedata.normalize("NFKC", word).translate(_FOLD_TABLE)
     if not keep_diacritics:
         word = _HARAKAT.sub("", word)
     word = _PUNCT.sub("", word)
@@ -175,6 +184,8 @@ def urdu_plurals(word: str, loanword: bool = False) -> List[str]:
     out: List[str] = []
 
     if loanword:
+        if len(word) < 3 and word not in SHORT_LOAN_OK:
+            return []                            # "اپ" -> "اپس"، "آن" -> "آنز" is junk
         if not word.endswith(("ی", "ہ", "ا")):
             out.append(word + "س")                   # لنکس، نوٹس، اسٹیشنس (press style)
             out.append(word + "ز")                   # کمپیوٹرز، سرورز، ٹریلرز (variant)
@@ -185,15 +196,19 @@ def urdu_plurals(word: str, loanword: bool = False) -> List[str]:
 
     last = word[-1]
     if last == "ا" and word.endswith("یا"):
-        out += [word + "ں", word[:-1] + "یوں", word[:-1] + "ؤں"]   # چڑیاں، چڑیوں، دنیاؤں
+        stem = word[:-1]                                          # چڑی، دنی
+        out += [word + "ں", stem + "وں"]                           # چڑیاں، چڑیوں / دنیاں، دنیوں
     elif last == "ا":
         out += [word[:-1] + "ے", word[:-1] + "وں"]    # لڑکا -> لڑکے، لڑکوں
     elif last in "یے":
         out += [word + "اں", word[:-1] + "یوں"]       # لڑکی -> لڑکیاں، لڑکیوں
     elif last == "ہ":
-        out += [word[:-1] + "ے", word[:-1] + "وں"]    # کمرہ -> کمرے، کمروں
+        if len(word) > 1 and word[-2] in "اآویے":       # گاہ/راہ/پناہ keep the ہ
+            out += [word + "یں", word + "وں"]           # گاہیں، گاہوں
+        else:                                          # کمرہ -> کمرے، کمروں
+            out += [word[:-1] + "ے", word[:-1] + "وں"]
     elif last == "ں":
-        out += [word[:-1] + "نوں"]
+        out += [word[:-1] + "ئیں", word[:-1] + "اؤں"]              # ماں -> مائیں، مااؤں
     elif last == "و":
         out += [word + "ں"]
     elif last in "تٹ":
@@ -207,14 +222,107 @@ def urdu_plurals(word: str, loanword: bool = False) -> List[str]:
     return _dedupe(out)
 
 
-def _pluralizable(word: str) -> bool:
-    """False for seeds that are already plural / oblique forms.
+# The only two-letter loanwords whose press plural is real Urdu ("ٹچز").
+SHORT_LOAN_OK: Set[str] = {"ٹچ"}
+
+
+# Endings that mean "this is already an inflected form": the plural, oblique and
+# derivative stages must never run on such a seed again. Kept in one place so the
+# rule cannot drift between stages (that is how "جوتےاں" and "بازؤنوں" appeared).
+_INFLECTED_ENDINGS: Tuple[str, ...] = ("وں", "یں", "اں", "ات", "ے", "ؤں")
+
+
+# Sections whose words are grammatical glue, names or titles: they have no
+# plural form, so the plural stage must never touch them ("اے" -> "اےاں" was junk).
+NON_PLURAL_SECTIONS: Set[str] = {
+    "function", "number", "proper", "name", "allah", "nabi", "ahlbayt", "sahaba",
+}
+
+
+# Singular words that merely *look* inflected (they end in a plural marker but
+# are dictionary entries in their own right).
+_SINGULAR_LOOKALIKES: Set[str] = {
+    "ماں", "ہاں", "دھواں", "اماں", "پاؤں", "گاؤں", "چاؤں", "ناں", "کاں", "جہاں",
+    "کہاں", "یہاں", "وہاں", "دھیان", "عنوان", "مہمان", "آسان", "جوان", "زبان",
+    "بیان", "عیان", "روان", "سامان", "نادان", "انجان", "نمایاں", "تاباں",
+}
+
+_INFLECTED_SEED_CACHE: Set[str] = set()
+
+
+def _inflected_seed_forms() -> Set[str]:
+    """Every form the plural rules can derive from the curated banks.
+
+    Built lazily from the seed banks themselves, so "this seed is already a
+    plural" is *derived*, not guessed from its spelling: جوتے, دکانوں, بکریاں and
+    بازؤں are recognised, while ماں, گاؤں and سامان (singulars that happen to end
+    in a plural-looking sequence) are not.
+    """
+    if not _INFLECTED_SEED_CACHE:
+        for entries in LexiconForge()._base_sections().values():      # noqa: SLF001
+            for entry in entries:
+                for raw in entry.split():
+                    word = fold_seed(raw)
+                    if len(word) < 2:
+                        continue
+                    _INFLECTED_SEED_CACHE.update(urdu_plurals(word))
+                    _INFLECTED_SEED_CACHE.update(urdu_plurals(word, loanword=True))
+    return _INFLECTED_SEED_CACHE
+
+
+def _already_inflected(word: str) -> bool:
+    """True when *word* is (or looks like) an inflected form, not a base word."""
+    if word in _SINGULAR_LOOKALIKES:
+        return False
+    if word in _inflected_seed_forms():
+        return True
+    return word.endswith(_INFLECTED_ENDINGS)
+
+
+def _pluralizable(word: str, section: str = "") -> bool:
+    """False for seeds that are already plural / oblique, or grammatically fixed.
 
     "جوتے", "دکانوں" and "بکریاں" are stored as dictionary entries, but the
     plural stage must not run on them again (otherwise the forge invents
-    "جوتےاں" or "بکریاںی").
+    "جوتےاں" or "بکریاںی"). Function words, numbers and names take no plural
+    either - that is how "اےاں" and "کوےاں" used to appear.
+
+    Two-letter *content* words stay pluralizable on purpose: دل -> دلوں,
+    خط -> خطیں, غم -> غموں are real Urdu, and losing them was a regression the
+    word audit caught.
     """
-    return not (len(word) > 3 and word.endswith(("وں", "یں", "اں", "ے", "ات")))
+    if len(word) < 2 or section in NON_PLURAL_SECTIONS:
+        return False
+    return not _already_inflected(word)
+
+
+# Derivational tails. A word that already carries one of them must not take a
+# second one: "فنکار" + "گر" is not a word, and neither is "دکاندار" + "دار".
+_AGENTIVE_TAILS: Tuple[str, ...] = (
+    "دار", "مند", "کار", "دان", "فروش", "ساز", "گر", "بان", "والا", "والی",
+)
+
+
+def _stackable(base: str, suffix: str) -> bool:
+    """False when *suffix* would repeat a derivational tail the base already has."""
+    if not base.endswith(_AGENTIVE_TAILS):
+        return True
+    if base + suffix in KEEP_FORMS:              # workگر, کارگر-style exceptions
+        return True
+    # a tail may follow a *different* tail only when the result is listed above
+    for tail in _AGENTIVE_TAILS:
+        if base.endswith(tail):
+            return suffix == tail and False
+    return True
+
+
+def _derivable(word: str) -> bool:
+    """True when *word* may receive a derivational suffix or compound head.
+
+    Urdu builds "کتاب" + "دان" and "پھول" + "والا", but never attaches a head to
+    an inflected stem: "کیفے" is the oblique of کیفہ, so "کیفےدان" is not a word.
+    """
+    return len(word) >= 3 and not _already_inflected(word)
 
 
 # Inflection markers that must never attach to a sacred name.
@@ -225,6 +333,15 @@ def _sacred_set() -> Set[str]:
     """Canonical form of every sacred name (Allah, Anbiya, Ahl al-Bayt, Sahaba)."""
     blob = " ".join((ALLAH_NAMES, NABI_NAMES, AHL_BAYT_NAMES, SAHABA_NAMES))
     return {w for w in (canonicalize(t) for t in blob.split()) if w}
+
+
+# Nominalisers that turn a person's *name* into nonsense ("نبیپن", "محمدگی").
+# They are blocked on a sacred stem exactly like the inflection markers; the
+# everyday -ی / -یت forms (آدمی، کریمی، محمدیت) are real words and stay.
+_SACRED_JUNK_SUFFIXES: Tuple[str, ...] = ("پن", "گی", "اوٹ", "ائی")
+
+# Real words that happen to look like a sacred name + junk suffix.
+SACRED_DERIVATIVE_EXCEPTIONS: Set[str] = {"حیائی"}
 
 
 # Sacred names that are *also* ordinary Urdu vocabulary (homographs). For these
@@ -251,12 +368,19 @@ def is_sacred_derivative(token: str) -> bool:
     token = canonicalize(token)
     if not token or token in SACRED_NAMES:
         return False
-    for marker in _INFLECTION_MARKERS:
+    if token in SACRED_DERIVATIVE_EXCEPTIONS:
+        return False
+    for marker in _INFLECTION_MARKERS + _SACRED_JUNK_SUFFIXES:
         if token.endswith(marker) and len(token) > len(marker):
             stem = token[:-len(marker)]
             if stem in SACRED_NAMES and stem not in SACRED_HOMOGRAPH_STEMS:
                 return True
     return False
+
+
+def _is_sorted(items: Sequence[str]) -> bool:
+    """True when *items* is strictly ascending (the forge already guarantees it)."""
+    return all(a < b for a, b in zip(items, items[1:]))
 
 
 def _dedupe(items: Iterable[str]) -> List[str]:
@@ -270,6 +394,13 @@ def _dedupe(items: Iterable[str]) -> List[str]:
 
 
 def attach_suffix(word: str, suffix: str) -> str:
+    """Attach a derivational suffix with the orthographic guards.
+
+    A stem that ends in the nasal ں never takes a bare -ی: the real forms are
+    built from the nasal-free stem (دھواں -> دھویں) or not at all.
+    """
+    if suffix in ("ی", "ئی") and word.endswith("ں"):
+        return ""
     """Attach a derivational suffix using Urdu orthographic rules.
 
     Handles the cases where a naive ``word + suffix`` would be misspelled:
@@ -282,6 +413,8 @@ def attach_suffix(word: str, suffix: str) -> str:
     if not suffix or len(word) < 2:
         return ""
     if word.endswith(suffix):                 # avoid "دوستتی" / "کتابب"
+        return ""
+    if suffix in _AGENTIVE_TAILS and not _stackable(word, suffix):
         return ""
     last = word[-1]
     if suffix == "ی":
@@ -613,7 +746,7 @@ ADDITIONAL_SEEDS: Dict[str, str] = {
     "adjective": (
         "اونچ نیچ گہر اتھل ہموار ناہموار ٹیڑھا سیدھا کھڑا جھکا ترچھا "
         "گول بیضوی نوکیلا کند دھار دار بھاری پھرتیلا چست سڈول متناسب "
-        "خوشبودار بدبودار چکنا کھردرا ریشے دار گھنا ویران آباد شاداب ہرا بھرا "
+        "خوشبودار بدبودار چکنا کھردرا ریشےدار ریشمی گھنا ویران آباد شاداب ہرا بھرا "
         "خشک نم زنگ آلود چمکتی دمکتی مدھم روشن تاریک صاف شفاف گدلا "
         "ذہین کند ذہن بیدار غافل چوکس لاپرواہ محتاط بے پروا مخلص بے غرض "
         "خود غرض ضدی ہٹی ضد کرنے والا نرم مزاج سخت گیر کھرا کھوٹا "
@@ -1161,7 +1294,7 @@ RULES: Dict[str, Rule] = {
     "color": Rule(suffixes=("ی",), gender_forms=True),
     "adjective": Rule(
         prefixes=("بے", "نا", "غیر", "کم", "خوش", "بد", "ہم", "خود"),
-        modifiers=("سا", "سی"),
+        modifiers=(),   # "سرسبز سا" is two words; fusing it made "سرسبزسا"
         gender_forms=True,
         abstract_forms=True,
     ),
@@ -1178,6 +1311,89 @@ MARKET_SECTIONS: Set[str] = {
 
 # Compound heads that genuinely fuse into ONE Urdu token, per section.
 # ("چائے" + "خانہ" = چائے خانہ، "سبزی" + "منڈی" = سبزی منڈی، ...)
+# A head is a *place or shop* morpheme (خانہ، گاہ، دکان، منڈی، بازار، گودام).
+# Attaching these to whole sections produced 5,000+ junk tokens ("آلوخانہ",
+# "آنکھگاہ", "آلودگیگودام", "آرڈرمنڈی"), so each head now carries a curated
+# host list - the same design that already keeps the agentive stage clean.
+# Heads that only ever made junk (گھر، چوک، گلی) are deliberately absent.
+HEAD_HOSTS: Dict[str, Set[str]] = {
+    "خانہ": {"چائے", "دوا", "ڈاک", "کتاب", "مہمان", "قہوہ", "مطب", "آرام", "علاج",
+             "دودھ", "نماز", "عجائب", "کتب"},
+    "گاہ": {"آرام", "ورزش", "تفریح", "عبادت", "شکار", "زیارت", "قیام", "کار", "سیر",
+            "دید", "نظارہ", "خواب", "علاج", "تدریس", "مشق", "تربیت", "استقبال",
+            "نماز", "کتب", "عجائب"},
+    "دکان": {"چائے", "دوا", "نان", "جوتا", "کپڑا", "گوشت", "سبزی", "پھل", "مچھلی",
+             "دودھ", "قلم", "کتاب", "حلوہ", "مٹھائی"},
+    "منڈی": {"سبزی", "پھل", "مچھلی", "غلہ", "اناج", "آلو", "پیاز", "گوشت",
+             "پھول", "دال", "مویشی", "مرغی", "انڈا"},
+    "بازار": {"کتاب", "غلہ", "کپڑا", "پھول", "سبزی", "سونا", "مویشی", "غلام", "چائے"},
+    "گودام": {"غلہ", "اناج", "لکڑی", "سامان", "مال", "کپڑا", "تلوار"},
+    "میدان": {"کھیل", "جنگ", "پریڈ", "دوڑ", "طاقت"},
+    "اڈہ": {"بس", "ریل", "گاڑی", "جہاز"},
+    "کھیت": {"پھول", "سبزی", "گندم", "چاول", "کپاس"},
+}
+
+
+# Each agentive suffix only attaches to the stems that really take it. The blind
+# cross product (226 hosts x 10 suffixes) produced "اسٹیڈیمفروش", "آبپاشیدان",
+# "اخبارساز" ... so the pairs are curated instead of generated.
+AGENTIVE_SUFFIX_HOSTS: Dict[str, Set[str]] = {
+    "دار": {"دکان", "کارخانہ", "کتاب", "اخبار", "اخبارات", "علم", "پرچم", "زمین", "جائداد",
+            "منڈی", "بازار", "گودام", "مکان", "دفتر", "ہوٹل", "ریسٹورنٹ", "رکشہ",
+            "ٹرک", "ٹیکسی", "سائیکل", "تھانہ", "محلہ", "ہسپتال", "کلینک", "بینک"},
+    "مند": {"عقل", "دانش", "ہنر", "نصیب", "قیمت", "اثر", "درد", "دولت", "برکت",
+            "فائدہ", "ہدف", "مقصد", "ہمت", "طاقت", "زر", "رتبہ", "علم"},
+    "کار": {"خدمت", "فن", "ہنر", "نیکی", "بدی", "خود"},
+    "دان": {"گل", "چائے", "قلم", "نمک", "پیک", "شکر", "آٹا", "میوہ", "مرچ", "دودھ"},
+    "فروش": {"پھل", "سبزی", "مچھلی", "گوشت", "دودھ", "کتاب", "کپڑا", "جوتا", "دوا",
+             "پھول", "غلہ", "اناج", "اخبار", "ٹکٹ", "مصالحہ", "حلوہ", "مٹھائی",
+             "چائے", "نان", "چاول", "دال", "انڈا", "مرغی"},
+    "ساز": {"زیور", "جوتا", "بستر", "گھڑی", "بندوق", "نقشہ", "کھلونا", "فرنیچر"},
+    "گر": {"زر", "نقش", "صورت", "بت"},
+    "بان": {"باغ", "در", "پاس", "نگہ"},
+    "ناک": {"خطرہ", "درد", "شرم", "وحشت", "رنج", "الم", "ہیبت"},
+    "والا": {"پھل", "سبزی", "پھول", "دودھ", "مچھلی", "گوشت", "کتاب", "کپڑا", "جوتا",
+             "گھی", "تیل", "چاول", "دال", "انڈا", "مرغی", "اونٹ", "گھوڑا", "بس",
+             "گاڑی", "ریل", "جہاز", "سائیکل", "فلم", "ٹوپی"},
+}
+
+AGENTIVE_SUFFIXES: Tuple[str, ...] = tuple(AGENTIVE_SUFFIX_HOSTS)
+
+
+# Western loans that Urdu pluralises with the English -ز / -س ending. Applied per
+# word: a blanket "loan" rule on these sections mints junk like "گاڑیز" and "ریلس".
+LOAN_PLURAL_HOSTS: Dict[str, Tuple[str, ...]] = {
+    "اسٹیشن": ("اسٹیشنز",),
+    "کمپیوٹر": ("کمپیوٹرز",),
+    "موبائل": ("موبائلز",),
+    "ٹکٹ": ("ٹکٹس",),
+    "بورڈ": ("بورڈز",),
+    "انجن": ("انجنوں", "انجنز"),
+    "کیبل": ("کیبلز",),
+    "پرنٹر": ("پرنٹرز",),
+    "کیمرہ": ("کیمرے", "کیمرز"),
+    "پوسٹر": ("پوسٹرز",),
+    "فائل": ("فائلیں", "فائلز"),
+    "فارم": ("فارمز",),
+    "رپورٹ": ("رپورٹیں", "رپورٹس"),
+    "بینک": ("بینکس", "بینکوں"),
+    "کورس": ("کورسز",),
+    "برانڈ": ("برانڈز",),
+}
+
+
+def _agentive_ok(stem: str, suffix: str) -> bool:
+    """May the agentive *suffix* attach to *stem*? Curated pairs only."""
+    hosts = AGENTIVE_SUFFIX_HOSTS.get(suffix)
+    return bool(hosts) and stem in hosts
+
+
+def _head_allowed(head: str, word: str) -> bool:
+    """May *head* attach to *word*? Only curated host stems qualify."""
+    hosts = HEAD_HOSTS.get(head)
+    return bool(hosts) and word in hosts
+
+
 HEADS: Dict[str, Tuple[str, ...]] = {
     "food": ("خانہ", "دان", "منڈی", "دکان", "فروش", "گھر"),
     "household": ("خانہ", "دان", "دکان", "گھر"),
@@ -1232,7 +1448,20 @@ class LexiconForge:
         self.stats: Dict[str, int] = {}
 
     # ---------------------------------------------------------------- core
+    # Hand-written banks may contain a spaced compound that the author wants
+    # fused ("چائے خانہ" -> چائےخانہ). Generated stages must never fuse: a space
+    # there means the generator glued a phrase together, which is how
+    # "اٹھاائی والا" turned into the junk token "اٹھائیوالا".
+    FUSING_BUCKETS = ("1_curated", "8_extra_forms")
+
+    @staticmethod
+    def _may_fuse(bucket: str) -> bool:
+        return bucket.startswith("2_") or bucket in LexiconForge.FUSING_BUCKETS
+
     def _add(self, sink: List[str], raw: str, bucket: str) -> bool:
+        if not self._may_fuse(bucket) and any(ch.isspace() for ch in raw):
+            self.stats["0_skipped_phrases"] = self.stats.get("0_skipped_phrases", 0) + 1
+            return False
         token = canonicalize(raw, self.keep_diacritics)
         if not token or token in self._seen or not is_valid_token(token, self.min_len, self.max_len):
             return False
@@ -1245,7 +1474,13 @@ class LexiconForge:
 
     @staticmethod
     def _split(blob: str) -> List[str]:
-        return [w for w in blob.split() if w]
+        """Split a seed bank and fold every entry.
+
+        Folding *before* the guards matters: a seed typed with a presentation
+        form ("بازﺅں") would otherwise slip past the inflection checks, because
+        the guard cannot recognise "ﺅں" as the plural marker "ؤں".
+        """
+        return [fold_seed(w) for w in blob.split() if w]
 
     def _sections(self) -> Dict[str, List[str]]:
         """Base seeds + second-tier seeds + third-tier extras, merged per section."""
@@ -1354,8 +1589,10 @@ class LexiconForge:
         if exhaustive or unlimited:
             expandable: List[str] = []
             for name in EXHAUSTIVE_SECTIONS:
+                if name in SACRED_SECTIONS:        # never inflect a sacred name
+                    continue
                 expandable.extend(sections.get(name, ()))
-            self._exhaustive(out, expandable or curated)
+            self._exhaustive(out, expandable or curated, sections)
 
         # stage 12 - UNLIMITED depth expansion (opt-in, quality-gated)
         if unlimited:
@@ -1370,14 +1607,9 @@ class LexiconForge:
     def _compounds(self, out: List[str], sections: Dict[str, List[str]]) -> None:
         """Fuse noun + compound head into real single-token Urdu words."""
         before = len(out)
-        for name, heads in HEADS.items():
-            for word in sections.get(name, ()):
-                if len(word) < 3 or word.endswith(("اں", "وں", "یں")):
-                    continue
-                for head in heads:
-                    if word == head:
-                        continue
-                    self._add(out, word + head, "9_compounds")
+        for head in sorted(HEAD_HOSTS):
+            for word in sorted(HEAD_HOSTS[head]):
+                self._add(out, word + head, "9_compounds")
         self.stats["9_compounds_total"] = len(out) - before
 
     # ------------------------------------------------------------ verb nouns
@@ -1394,7 +1626,7 @@ class LexiconForge:
             self._add(out, attach_suffix(base, "ائی"), "9_verb_nouns")
             self._add(out, attach_suffix(base, "اوٹ"), "9_verb_nouns")
             self._add(out, base + "ن", "9_verb_nouns")          # چلن، لکھن
-            self._add(out, base + "ائی والا", "9_verb_nouns")
+            self._add(out, base + "نےوالا", "9_verb_nouns")
         self.stats["9_verb_nouns_total"] = len(out) - before
 
     # -------------------------------------------------------------- unlimited
@@ -1431,7 +1663,7 @@ class LexiconForge:
         ``recall=True``.
         """
         before = len(out)
-        agentive = ("دار", "مند", "کار", "دان", "فروش", "ساز", "گر", "بان")
+        agentive = AGENTIVE_SUFFIXES
         quality = ("ی", "پن", "گی", "ت")   # default quality family
         relational = ("ی",)
         stack_suffixes = ("ی", "پن")
@@ -1445,39 +1677,50 @@ class LexiconForge:
             human = name in HUMAN_SECTIONS
             quality_sec = name in QUALITY_SECTIONS
             loan_only = name in LOAN_ONLY_SECTIONS
-            heads = HEADS.get(name, ())
+            heads = tuple(h for h in HEADS.get(name, ())
+                          if any(h in HEAD_HOSTS for _ in (0,)))
             if human:
                 suffixes = relational          # agentives come from stage 10b
             elif quality_sec:
                 suffixes = QUALITY_SUFFIXES.get(name, ("ی",))
             elif loan_only:
-                suffixes = ()
-                heads = HEADS.get(name, ())[:1]
+                suffixes = relational          # کمانڈری yes، کمانڈرپن no
+                heads = ()
             else:
-                suffixes = relational
+                rule = RULES.get(name)
+                # A noun section only takes what its own Rule allows - that is what
+                # kept "گردنپن" and "ہڑتالگی" out of the build.
+                suffixes = tuple(rule.suffixes) if rule else relational
             allowed_prefixes = PREFIX_SAFE_SECTIONS.get(name, ())
 
             for word in words:
-                if len(word) < 3 or len(word) > 12:
-                    continue
-                if word.endswith(("اں", "وں", "یں", "ات", "ے")):
+                if len(word) > 12 or not _derivable(word):
                     continue
                 level1: List[str] = []
                 # XOR choice A - one derivational suffix
                 for suffix in suffixes:
+                    if suffix in AGENTIVE_SUFFIX_HOSTS and not _agentive_ok(word, suffix):
+                        continue
                     formed = attach_suffix(word, suffix)
                     if formed and self._add(out, formed, "A_unlimited"):
                         level1.append(formed)
                 # XOR choice B - one compound head
                 for head in dict.fromkeys(heads):
-                    if head != word:
-                        self._add(out, word + head, "A_unlimited")
+                    if head == word:
+                        continue
+                    if head in HEAD_HOSTS and not _head_allowed(head, word):
+                        continue
+                    if head in AGENTIVE_SUFFIX_HOSTS and not _agentive_ok(word, head):
+                        continue
+                    self._add(out, word + head, "A_unlimited")
                 if depth < 2:
                     continue
-                if not loan_only:                      # -والا family
+                if not loan_only and word in _WALA_HOSTS:   # -والا family, curated
                     for modifier in wala:
                         self._add(out, word + modifier, "A_unlimited")
                     # plural + والا: کتابوں والا، دواؤں والا (very idiomatic)
+                    if not _pluralizable(word, name):
+                        continue
                     for plural in urdu_plurals(word)[:2]:
                         self._add(out, plural + "والا", "A_unlimited")
                     # relational ی: بازاری، پاکستانی، موبائلی
@@ -1485,28 +1728,24 @@ class LexiconForge:
                     # market / place heads, only where they make sense
                     if name in MARKET_SECTIONS:
                         for head in heads_wide:
-                            self._add(out, word + head, "A_unlimited")
+                            if _head_allowed(head, word):
+                                self._add(out, word + head, "A_unlimited")
                 for prefix in allowed_prefixes:        # curated hosts only
                     if word in _PREFIX_HOSTS.get(prefix, ()):
                         self._add(out, prefix + word, "A_unlimited")
                         for suffix in suffixes[:3]:
                             self._add(out, prefix + attach_suffix(word, suffix),
                                       "A_unlimited")
-                if depth < 3:
+                if depth < 3 or loan_only:
                     continue
-                for formed in level1:                  # second suffix (recall tier)
+                for formed in level1:                  # second suffix on native words
                     for suffix in stack_suffixes:
                         self._add(out, attach_suffix(formed, suffix), "A_unlimited")
                 if depth < 4:
                     continue
-                for head in dict.fromkeys(heads):      # two-head compounds
-                    for second in heads_all:
-                        if second not in (head, word):
-                            self._add(out, word + head + second, "A_unlimited")
-        self.stats["A_unlimited_total"] = len(out) - before
-
-        self.stats["A_unlimited_total"] = len(out) - before
-
+                # depth 4 previously glued two compound heads together and minted
+                # "انجینئرگھرگر" / "ریتسازفروش". Real triple compounds are rare,
+                # so the curated, host-gated head table is what stays.
         self.stats["A_unlimited_total"] = len(out) - before
 
     # ------------------------------------------------------------------ recall
@@ -1562,17 +1801,19 @@ class LexiconForge:
             if len(word) < 2:
                 continue
             # 1. plurals + oblique forms
-            if rule.plurals != "none" and _pluralizable(word):
+            if rule.plurals != "none" and _pluralizable(word, name):
                 for form in urdu_plurals(word, loanword=(rule.plurals == "loan")):
                     self._add(out, form, bucket)
+            for form in LOAN_PLURAL_HOSTS.get(word, ()):      # اسٹیشنز، کمپیوٹرز
+                self._add(out, form, bucket)
             # 2. derivational suffixes (orthography-guarded)
-            if len(word) >= 3:
+            if _derivable(word):
                 for suffix in rule.suffixes:
                     if is_number and word in _ORDINAL_SKIP:
                         continue
                     self._add(out, attach_suffix(word, suffix), bucket)
             # 3. productive prefixes - only on bases that really take them
-            if len(word) >= 3:
+            if _derivable(word):
                 for prefix in rule.prefixes:
                     hosts = _PREFIX_HOSTS.get(prefix)
                     if hosts and word in hosts:
@@ -1605,13 +1846,15 @@ class LexiconForge:
     # ------------------------------------------------------------ adjectives
     def _gender_forms(self, word: str, out: List[str], bucket: str) -> None:
         """Urdu adjectives agree in gender/number: اچھا -> اچھی، اچھے."""
+        if not _derivable(word):
+            return
         if word.endswith("ا") and len(word) >= 3:
             self._add(out, word[:-1] + "ی", bucket)      # feminine singular
             self._add(out, word[:-1] + "ے", bucket)      # oblique / plural
 
     def _abstract_forms(self, word: str, out: List[str], bucket: str) -> None:
         """Nominalise adjectives: بڑا -> بڑائی، نرم -> نرمی، اچھا -> اچھاپن."""
-        if len(word) < 3:
+        if not _derivable(word):
             return
         if word.endswith("ا"):
             self._add(out, word[:-1] + "ائی", bucket)    # بڑائی، اونچائی، گہرائی
@@ -1633,10 +1876,15 @@ class LexiconForge:
         real word but "ذہانتساز" is not, so ذہانت is simply not in the set.
         """
         before = len(out)
-        suffixes = ("دار", "مند", "کار", "دان", "فروش", "ساز", "گر", "بان", "والا", "والی")
-        for host in AGENTIVE_HOSTS:
-            for suffix in suffixes:
+        for suffix, hosts in AGENTIVE_SUFFIX_HOSTS.items():
+            for host in hosts:
+                if not _derivable(host):    # کیفے is an oblique, کیفےدان is not a word
+                    continue
                 self._add(out, attach_suffix(host, suffix), "9b_agentives")
+                if suffix in ("والا", "والی"):
+                    continue
+                # ی-plural of the occupation: دکانداروں، سبزیفروشوں
+                self._add(out, attach_suffix(host, suffix) + "وں", "9b_agentives")
         self.stats["9b_agentives_total"] = len(out) - before
 
     # ------------------------------------------------------------------ verbs
@@ -1647,16 +1895,25 @@ class LexiconForge:
                  + self._split(VERB_ROOTS_EXTRA)
                  + self._split(VERB_ROOTS_2))
         seen: Set[str] = set()
-        for root in roots:
+        skipped = 0
+        for raw in roots:
+            root = _clean_root(raw)
+            if root is None:
+                skipped += 1
+                continue
             if len(root) < 2 or root in seen:
                 continue
             seen.add(root)
             for form in conjugate(root):
                 self._add(out, form, "7_verb_forms")
+        self.stats["7_verb_skipped"] = skipped
         self.stats["7_verb_total"] = len(out) - before
 
     # -------------------------------------------------------------- exhaustive
-    def _exhaustive(self, out: List[str], curated: Sequence[str]) -> None:
+    def _exhaustive(self, out: List[str], curated: Sequence[str],
+                    sections: "Dict[str, List[str]] | None" = None) -> None:
+        # ``curated`` is the full seed pool; sacred names are filtered out here as
+        # a second line of defence (the caller already skips their sections).
         """Maximum-recall expansion with section gating.
 
         * suffixes: productive and phonotactically guarded
@@ -1666,10 +1923,15 @@ class LexiconForge:
         before = len(out)
         suffixes = ("ی", "پن", "گی", "دار", "مند", "ناک", "کار", "دان", "گر", "ساز")
         safe_prefixes = ("بے", "نا", "لا", "غیر", "کم", "خوش", "بد", "ہم", "خود", "نو")
+        adjectives = set(sections.get("adjective", ())) if isinstance(sections, dict) else set()
         for word in curated:
-            if len(word) < 3 or not _pluralizable(word):
+            if not _derivable(word) or is_sacred_derivative(word) or word in SACRED_NAMES:
                 continue
             for suffix in suffixes:
+                if suffix in AGENTIVE_SUFFIX_HOSTS and not _agentive_ok(word, suffix):
+                    continue
+                if suffix in ("پن", "گی", "ت", "ائی") and word not in adjectives:
+                    continue          # "گردنپن"، "ہڑتالگی" are not words
                 self._add(out, attach_suffix(word, suffix), "9_exhaustive")
             for prefix in safe_prefixes:
                 hosts = _PREFIX_HOSTS.get(prefix)
@@ -1740,6 +2002,33 @@ IRREGULAR_PERFECTIVE: Dict[str, Tuple[str, ...]] = {
 }
 
 
+# Some verb banks accidentally list an *infinitive* ("ابھرنا", "کرنا") or a plain
+# noun ("آرام", "یاد") as if it were a root. Left alone they mint junk like
+# "آرامنےوالا" and "انکارتا", so roots are repaired before conjugation: an
+# infinitive-looking entry gives up its "نا / نی / نے" (ابھرنا -> ابھر), and a
+# short list of noun-only entries is refused outright.
+NON_VERB_ROOTS: Set[str] = {
+    "آرام", "انکار", "توجہ", "خالی", "یاد", "ہنسی", "بند", "ٹیک", "کام", "فرائی",
+    "بھڑ", "دوست", "دشمن", "سپرد", "عرض", "بحث", "قبول", "برتاو", "لحاظ",
+    "مسترد", "منظور", "مقرر", "برقرار", "شامل", "داخل",
+}
+
+
+def _clean_root(root: str) -> "str | None":
+    """Repair one bank entry -> a real verb root, or ``None`` to refuse it."""
+    if len(root) < 2 or root in NON_VERB_ROOTS:
+        return None
+    half, odd = divmod(len(root), 2)
+    if not odd and root[:half] == root[half:]:      # بڑبڑ -> بڑبڑا (بڑبڑانا)
+        return root + "ا"
+    if root.endswith(("نا", "نی", "نے")):
+        stem = root[:-2]
+        if len(stem) < 3:
+            return None                 # "سنا" -> "س" would be catastrophic
+        return stem or None
+    return root
+
+
 def conjugate(root: str) -> List[str]:
     """Return the productive conjugation family of an Urdu verb *root*.
 
@@ -1808,6 +2097,26 @@ def _report_build(stats: Dict[str, int]) -> None:
     print("    = %-24s %10s unique Urdu words" % ("TOTAL", f"{stats['0_total_words']:,}"))
 
 
+# Real Urdu words that the conservative conjunction guards would drop, because
+# they are built exactly like junk: an inflected-looking stem plus a head
+# ("چائے" + "خانہ", "ہفتے" + "وار"). Curated by hand, never generated - this is
+# the escape hatch that keeps the guards strict without losing real vocabulary.
+KEEP_FORMS: Set[str] = {
+    # inflected-looking stems + head ("چائے" + "خانہ", "ہفتے" + "وار")
+    "چائےخانہ", "ہفتےوار", "مہینےوار", "راتوںوار", "غمخوار", "سردار", "ریشےدار",
+    "کارگر", "کارمند", "ہنرمند", "باصلاحیت",
+    # person names take a second agentive tail
+    "چائےخانہ",
+    # place compounds whose stem is "abstract" by the guard's reckoning
+    "ڈاکخانہ", "مہمانخانہ", "ورزشگاہ", "تفریحگاہ", "عبادتگاہ", "شکارگاہ", "زیارتگاہ",
+    "قیامگاہ", "کارگاہ", "سیرگاہ", "دیدگاہ", "نظارگاہ", "غلہمنڈی", "پھلگودام",
+    "اناجگودام", "سبزیمنڈی",
+    # two-letter hosts that still take a head ("در" + "بان"), and set compounds
+    "دربان", "پاسبان", "نگہبان", "گلدان", "چائےدان", "عجائبگھر", "حیوانخانہ",
+    "گنگنانا",
+}
+
+
 def compile_lexicon(
     max_words: int = 0,
     keep_diacritics: bool = False,
@@ -1832,6 +2141,8 @@ def compile_lexicon(
     forge = LexiconForge(keep_diacritics=keep_diacritics, min_len=min_len, max_len=max_len)
     words, _roots = forge.forge(exhaustive=exhaustive, unlimited=unlimited,
                                 depth=depth, recall=recall)
+    words.extend(sorted(KEEP_FORMS))          # curated real words the guards drop
+    words = _dedupe(words) if not _is_sorted(words) else words
     words.sort()
     total = len(words)
 
@@ -1857,6 +2168,7 @@ def _iter_text_chunks(words: Sequence[str], chunk_tokens: int = CHUNK_TOKENS) ->
 
 def build_urdu_database(
     output_path: str | os.PathLike[str] = DB_FILENAME,
+    fmt: str = "plain",
     max_words: int = 0,
     keep_diacritics: bool = False,
     min_len: int = 2,
@@ -1871,6 +2183,9 @@ def build_urdu_database(
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    if fmt not in ("plain", "compact"):
+        raise ValueError("unknown format %r (use plain or compact)" % fmt)
+
     words, lexicon_stats = compile_lexicon(
         max_words=max_words, keep_diacritics=keep_diacritics,
         min_len=min_len, max_len=max_len, exhaustive=exhaustive,
@@ -1883,6 +2198,53 @@ def build_urdu_database(
     # MTIME is 0, so identical seeds always produce a byte-identical artifact.
     compressor = zlib.compressobj(GZIP_LEVEL, zlib.DEFLATED, GZIP_WBITS,
                                   GZIP_MEMLEVEL, zlib.Z_DEFAULT_STRATEGY)
+    if fmt == "compact":
+        body = pack_compact(words).encode("utf-8")
+        raw_bytes = len(body)
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=".urdu_db_", suffix=".part",
+                                            dir=str(path.parent))
+        try:
+            with os.fdopen(tmp_fd, "wb") as fh:
+                fh.write(compressor.compress(body))
+                fh.write(compressor.flush())
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, path)
+            try:
+                os.chmod(path, 0o644)
+            except OSError:
+                pass
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        write_seconds = time.perf_counter() - t0
+        packed_bytes = path.stat().st_size
+        ratio = (1.0 - packed_bytes / raw_bytes) * 100.0 if raw_bytes else 0.0
+        stats: Dict[str, object] = {
+            **lexicon_stats,
+            "0_raw_bytes": raw_bytes,
+            "0_packed_bytes": packed_bytes,
+            "0_compression_percent": round(ratio, 2),
+            "0_write_seconds": round(write_seconds, 4),
+            "0_sha256": _sha256(path),
+            "0_output": str(path),
+            "0_format": "compact",
+        }
+        if verbose:
+            print(
+                "[urduofdani] wrote %s  (compact / front-coded)\n"
+                "    payload  : %s\n"
+                "    gzip     : %s  (%.1f%% smaller)\n"
+                "    io time  : %.3fs\n"
+                "    sha256   : %s" % (
+                    path.name, _human(raw_bytes), _human(packed_bytes), ratio,
+                    write_seconds, stats["0_sha256"],
+                )
+            )
+        return stats
     tmp_fd, tmp_name = tempfile.mkstemp(prefix=".urdu_db_", suffix=".part", dir=str(path.parent))
     try:
         with os.fdopen(tmp_fd, "wb") as fh:
@@ -1924,6 +2286,7 @@ def build_urdu_database(
         "0_write_seconds": round(write_seconds, 4),
         "0_sha256": _sha256(path),
         "0_output": str(path),
+        "0_format": "plain",
     }
     if verbose:
         print(
@@ -1937,6 +2300,70 @@ def build_urdu_database(
             )
         )
     return stats
+
+
+# ---------------------------------------------------------------------------
+# COMPACT CODEC (front-coded, ~3x smaller than the plain single-space payload)
+# ---------------------------------------------------------------------------
+COMPACT_MAGIC = "URDUFC1"          # payload header: "URDUFC1 <count> <sha8>\n"
+
+
+def pack_compact(words: Sequence[str]) -> str:
+    """Front-code a *sorted* word list into newline-separated delta entries.
+
+    Every entry is a two-character base-36 shared-prefix length plus the part of
+    the word that differs from its predecessor. Sorted Urdu shares a lot of
+    prefix (کمپیوٹر / کمپیوٹروں / کمپیوٹرز …), which is exactly what DEFLATE
+    cannot exploit on its own because the shared part is spread over the file.
+
+    The header carries the word count and a checksum of the plain payload, so a
+    truncated or edited artifact fails loudly instead of loading half a
+    dictionary.
+    """
+    chunks = [COMPACT_MAGIC, " ", str(len(words)), " ",
+              hashlib.sha256(SEPARATOR.join(words).encode("utf-8")).hexdigest()[:16], "\n"]
+    prev = ""
+    for word in words:
+        n = 0
+        limit = min(len(prev), len(word))
+        while n < limit and prev[n] == word[n]:
+            n += 1
+        chunks.append("%02x" % n if n < 36 else _base36(n))
+        chunks.append(word[n:])
+        chunks.append("\n")
+        prev = word
+    return "".join(chunks)
+
+
+def _base36(value: int) -> str:
+    """Two-character base-36 (00-zz) - keeps every entry header fixed-width."""
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    return digits[(value // 36) % 36] + digits[value % 36]
+
+
+def unpack_compact(payload: str, verify_checksum: bool = False) -> List[str]:
+    """Decode a :func:`pack_compact` payload back into the word list."""
+    lines = payload.split("\n")
+    head = lines[0].split(" ")
+    count = int(head[1]) if len(head) > 1 else -1
+    checksum = head[2] if len(head) > 2 else ""
+    words: List[str] = []
+    append = words.append
+    prev = ""
+    for line in lines[1:]:
+        if not line:
+            continue
+        n = int(line[:2], 36)
+        word = prev[:n] + line[2:]
+        append(word)
+        prev = word
+    if count >= 0 and len(words) != count:
+        raise ValueError("compact payload truncated: %d of %d words" % (len(words), count))
+    if verify_checksum and checksum:
+        got = hashlib.sha256(SEPARATOR.join(words).encode("utf-8")).hexdigest()[:16]
+        if got != checksum:
+            raise ValueError("compact payload checksum mismatch")
+    return words
 
 
 def _sha256(path: Path) -> str:
@@ -1955,11 +2382,23 @@ def _human(num: float) -> str:
     return "%.2f GB" % num
 
 
-def load_urdu_database(path: str | os.PathLike[str] = DB_FILENAME) -> List[str]:
-    """Decompress the whole database and return it as a Python list of words."""
+def load_urdu_database(path: str | os.PathLike[str] = DB_FILENAME,
+                       verify_checksum: bool = False) -> List[str]:
+    """Decompress the whole database and return it as a Python list of words.
+
+    Two containers are understood, and the format is sniffed from the payload
+    itself so callers never have to care which one they were given:
+
+    * plain   - one line, single-space separated (fastest: one ``split`` call)
+    * compact - front-coded with a ``URDUFC1`` header (~3x smaller on disk)
+    """
     with gzip.open(path, "rb") as fh:
         payload = fh.read().decode("utf-8")
-    return payload.split(SEPARATOR) if payload else []
+    if not payload:
+        return []
+    if payload.startswith(COMPACT_MAGIC):
+        return unpack_compact(payload, verify_checksum=verify_checksum)
+    return payload.split(SEPARATOR)
 
 
 def iter_urdu_words(path: str | os.PathLike[str] = DB_FILENAME,
@@ -2126,6 +2565,10 @@ def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
         with gzip.open(path, "rb") as fh:
             raw = fh.read()
         text = raw.decode("utf-8")
+        compact = text.startswith(COMPACT_MAGIC)
+        if compact:
+            words = unpack_compact(text, verify_checksum=True)
+            text = SEPARATOR.join(words)          # every later check works on plain text
     except (OSError, EOFError, zlib.error) as exc:
         # A corrupt or non-gzip file is a *failed check*, never a traceback.
         if not quiet:
@@ -2133,12 +2576,14 @@ def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
             print("    [FAIL] gzip readable      %s: %s"
                   % (type(exc).__name__, exc))
         return False
-    words = [w for w in text.split(SEPARATOR) if w]
+    if not compact:
+        words = [w for w in text.split(SEPARATOR) if w]
     unique = set(words)
 
     present_sacred = sum(1 for w in unique if canonicalize(w) in SACRED_NAMES)
     checks: List[Tuple[str, bool, str]] = [
-        ("gzip readable", True, "%d bytes packed payload" % path.stat().st_size),
+        ("gzip readable", True, "%d bytes packed payload%s"
+         % (path.stat().st_size, " (compact)" if compact else "")),
         ("sacred names intact", not any(is_sacred_derivative(w) for w in words),
          "%d present, 0 inflected" % present_sacred),
         ("no newline", "\n" not in text and "\r" not in text, "single line"),
@@ -2245,6 +2690,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="cap the lexicon (0 = no cap: keep every generated token)")
     p.add_argument("--min-len", type=int, default=2, help="minimum token length")
     p.add_argument("--max-len", type=int, default=40, help="maximum token length")
+    p.add_argument("--format", choices=("plain", "compact"), default="plain",
+                   help="payload layout: plain single-line (fastest) or compact "
+                        "front-coded (~3x smaller, ~7 ms slower to load)")
     p.add_argument("--keep-diacritics", action="store_true",
                    help="keep harakat instead of folding them")
     p.add_argument("--exhaustive", action="store_true",
@@ -2282,6 +2730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             unlimited=args.unlimited or args.recall,
             depth=args.depth,
             recall=args.recall,
+            fmt=args.format,
         )
     elif not out.exists():
         print("[urduofdani] ERROR: %s not found - run once without --no-build." % out)
@@ -2291,8 +2740,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not verify_database(out, export_txt=args.export):
             return 1
     elif args.export:
-        with gzip.open(out, "rb") as fh:
-            Path(args.export).write_bytes(fh.read())
+        Path(args.export).write_text(SEPARATOR.join(load_urdu_database(out)), encoding="utf-8")
         print("[urduofdani] exported plain text -> %s" % args.export)
 
     if args.benchmark is not None:
