@@ -30,6 +30,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * `tests` grew to 63: word-audit regression tests (junk classes, real-word
   survival, sacred-name invariant, loan plurals) plus the earlier suites.
 
+### Packaging & integration
+
+* **`pyproject.toml`** — `pipx install .` / `pip install .` exposes the console
+  commands `urduofdani` and `urduofdani-engine`; the wheel ships code only, so the
+  dictionary is always built fresh, offline, in ~0.2 s.
+* **`URDUOFDANI_DB`** — an explicit database path now wins over auto-detection in
+  both CLIs, and an explicit `--db`/`start` path is used as-is (file, not folder).
+* **`urduofdani.py build --format compact`** — the front door can now produce the
+  front-coded tier directly (`urdu_database.compact.gz` /
+  `urdu_database.<mode>.compact.gz`, never touching the plain release artifact).
+
 ### Changed
 
 * **Honest counts.** The audit proved that a large share of the old builds was

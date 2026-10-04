@@ -48,7 +48,7 @@ python examples/autocomplete_app.py --list    # the GUI example starts headless
 * **Wildcard & fuzzy lookup** (`search --fuzzy`, edit distance on the prefix index) for the spell-correction use case.
 * **Domain packs** — ship optional `.gz` overlays (medical, legal, engineering) instead of growing the default build.
 * **Benchmark harness** — record `measure_tiers` output per commit and chart regressions.
-* **Packaging** — `pyproject.toml` with a console entry point (`urduofdani`) so `pipx install .` works, plus a pre-built release asset for non-Python users.
+* **Packaging** — ✅ `pyproject.toml` + console scripts (`urduofdani`, `urduofdani-engine`) with `pipx install .`; a pre-built release asset for non-Python users is still open.
 * **Over-generation watch-list** — the audit keeps `-یں` plurals broad so real feminine plurals (`دکانیں`, `زمینیں`) survive; tokens such as `شہیدیں` / `انگوریں` are legal-shaped but rare, and a per-word gender table is the honest way to tighten them.
 
 ### Later / ideas

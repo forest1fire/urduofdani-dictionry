@@ -1,0 +1,53 @@
+# --------------------------------------------------------------------------- #
+# urduofdani - installable packaging (stdlib only, no runtime dependencies)
+#
+#   pipx install .            # console commands: urduofdani, urduofdani-engine
+#   python -m build           # wheel + sdist
+#
+# The wheel ships *code*; the dictionary itself is one command away and stays
+# yours (deterministic, offline):
+#
+#   urduofdani build                     # 15,848 words / 43.9 KB  (plain)
+#   urduofdani build --format compact    # 15,848 words / 16.8 KB  (front-coded)
+#
+# Point the tools at an existing artifact from anywhere:
+#   export URDUOFDANI_DB=/path/to/urdu_database.txt.gz
+# --------------------------------------------------------------------------- #
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "urduofdani"
+version = "3.1.0"
+description = "High-speed Urdu text engine: single-space tokenization + gzip, zero dependencies"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "forest1fire" }]
+keywords = ["urdu", "dictionary", "nlp", "spellcheck", "autocomplete", "gzip", "stdlib"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Natural Language :: Urdu",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Text Processing :: Linguistic",
+]
+
+[project.urls]
+Homepage = "https://github.com/forest1fire/urduofdani-dictionary"
+Repository = "https://github.com/forest1fire/urduofdani-dictionary"
+Issues = "https://github.com/forest1fire/urduofdani-dictionary/issues"
+
+[project.scripts]
+urduofdani = "urduofdani:main"
+urduofdani-engine = "urduofdani_engine:main"
+
+[tool.setuptools]
+py-modules = ["urduofdani", "urduofdani_engine", "build_urdu_database"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

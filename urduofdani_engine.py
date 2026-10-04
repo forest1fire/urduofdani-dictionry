@@ -101,8 +101,18 @@ def find_database(start: Optional[str | os.PathLike[str]] = None) -> Optional[pa
     """Locate the dictionary .gz next to the app, the cwd or a PyInstaller bundle."""
     here = pathlib.Path(__file__).resolve().parent
     roots: List[pathlib.Path] = []
+    # An explicit path always wins - a file named directly, not a directory to
+    # be searched with the default file names.
+    override = os.environ.get("URDUOFDANI_DB")
+    if override:
+        env_path = pathlib.Path(override)
+        if env_path.is_file():
+            return env_path
+        roots.append(env_path)
     if start is not None:
         candidate = pathlib.Path(start)
+        if candidate.is_file():
+            return candidate
         roots += [candidate, candidate.parent]
     roots += [
         pathlib.Path.cwd(),
@@ -459,6 +469,9 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     print("  load     : %.3f ms" % info["load_ms"])
     print("  sample   : %s" % " ".join(engine.random_words(8, seed=7)))
     return 0
+
+
+main = _main          # console-script entry point (pyproject.toml)
 
 
 if __name__ == "__main__":

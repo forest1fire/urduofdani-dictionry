@@ -470,5 +470,77 @@ class TestShippedArtifacts(unittest.TestCase):
                            len(core.load_urdu_database(SHIPPED)))
 
 
+# --------------------------------------------------------------------------- #
+# 8. Packaging, environment override and the compact front-door build
+# --------------------------------------------------------------------------- #
+class TestPackagingAndEnv(unittest.TestCase):
+    def test_pyproject_declares_working_console_scripts(self):
+        import tomllib
+        data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+        scripts = data["project"]["scripts"]
+        self.assertIn("urduofdani", scripts)
+        self.assertIn("urduofdani-engine", scripts)
+        for target in scripts.values():
+            module_name, _, attr = target.partition(":")
+            module = __import__(module_name)
+            self.assertTrue(callable(getattr(module, attr)),
+                            "%s must be a callable entry point" % target)
+
+    def test_pyproject_modules_are_importable(self):
+        import tomllib
+        data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+        for name in data["tool"]["setuptools"]["py-modules"]:
+            with contextlib.redirect_stdout(io.StringIO()):
+                __import__(name)
+
+    def test_env_var_points_the_engine_at_a_database(self):
+        import urduofdani_engine as engine_mod
+        previous = os.environ.get("URDUOFDANI_DB")
+        os.environ["URDUOFDANI_DB"] = str(SHIPPED)
+        try:
+            found = engine_mod.find_database()
+            self.assertIsNotNone(found)
+            self.assertEqual(found.resolve(), SHIPPED.resolve())
+        finally:
+            if previous is None:
+                os.environ.pop("URDUOFDANI_DB", None)
+            else:
+                os.environ["URDUOFDANI_DB"] = previous
+
+    def test_env_var_is_used_by_the_front_door(self):
+        previous = os.environ.get("URDUOFDANI_DB")
+        os.environ["URDUOFDANI_DB"] = str(SHIPPED)
+        try:
+            self.assertEqual(front._resolve_db(None).resolve(), SHIPPED.resolve())
+        finally:
+            if previous is None:
+                os.environ.pop("URDUOFDANI_DB", None)
+            else:
+                os.environ["URDUOFDANI_DB"] = previous
+
+    def test_front_door_compact_build_writes_front_coded_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "probe.compact.gz"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = front.main(["build", "--mode", "mini", "--format", "compact",
+                                   "-o", str(out)])
+            self.assertEqual(code, 0)
+            self.assertTrue(out.exists())
+            with gzip.open(out, "rb") as fh:
+                head = fh.read(8)
+            self.assertEqual(head, b"URDUFC1 ")          # front-coded container
+            words = core.load_urdu_database(out, verify_checksum=True)
+            self.assertEqual(len(words), 3000)           # mini tier
+
+    def test_compact_defaults_never_clobber_the_plain_release(self):
+        self.assertNotEqual(front.default_output_path("default", "compact"),
+                            front.default_output_path("default", "plain"))
+        self.assertEqual(front.default_output_path("default", "compact"),
+                         front.COMPACT_DB)
+        self.assertEqual(front.default_output_path("mini", "compact"),
+                         "urdu_database.mini.compact.gz")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

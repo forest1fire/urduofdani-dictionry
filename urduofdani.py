@@ -27,6 +27,7 @@ Everything is stdlib-only and Windows-safe. Exit codes are script-friendly:
 from __future__ import annotations
 
 import argparse
+import os
 import gzip
 import random
 import subprocess
@@ -40,7 +41,9 @@ import build_urdu_database as core   # noqa: E402  (path set above)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_DB = "urdu_database.txt.gz"
+COMPACT_DB = "urdu_database.compact.gz"
 FULL_DB = "urdu_database.full.txt.gz"
+FULL_COMPACT_DB = "urdu_database.full.compact.gz"
 
 MODES = {
     "mini": dict(max_words=3000, exhaustive=False, unlimited=False, depth=2,
@@ -69,14 +72,26 @@ def _utf8_console() -> None:
 
 
 def _resolve_db(value: Optional[str], prefer_full: bool = False) -> Path:
-    """Pick the database: explicit path > full build (if asked) > default > error."""
+    """Pick the database.
+
+    Order: explicit `--db` > `$URDUOFDANI_DB` > the full build (if asked) >
+    next to the script > the cwd > the full build.
+    """
     if value:
         chosen = Path(value)
         if not chosen.exists():                     # friendly failure, not a traceback
             raise SystemExit("[urduofdani] database not found: %s" % chosen)
         return chosen
-    candidates = [HERE / FULL_DB, HERE / DEFAULT_DB] if prefer_full else \
-                 [HERE / DEFAULT_DB, Path.cwd() / DEFAULT_DB, HERE / FULL_DB]
+    env = os.environ.get("URDUOFDANI_DB")
+    if env:
+        chosen = Path(env)
+        if not chosen.exists():
+            raise SystemExit("[urduofdani] database not found: %s" % chosen)
+        return chosen
+    candidates = [HERE / FULL_DB, HERE / DEFAULT_DB, HERE / FULL_COMPACT_DB,
+                  HERE / COMPACT_DB] if prefer_full else \
+                 [HERE / DEFAULT_DB, Path.cwd() / DEFAULT_DB, HERE / COMPACT_DB,
+                  HERE / FULL_DB]
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -109,7 +124,8 @@ def cmd_info(args: argparse.Namespace) -> int:
     print("  sacred names      : %d protected" % len(core.SACRED_NAMES))
     print("  compiler version  : %s" % core.SCRIPT_VERSION)
     print("  all databases     : %s" % ", ".join(
-        p.name for p in (storage, HERE / FULL_DB) if p.exists()))
+        p.name for p in (storage, HERE / COMPACT_DB, HERE / FULL_DB,
+                         HERE / FULL_COMPACT_DB) if p.exists()))
     _rule()
     rng = random.Random(20261004)          # deterministic sample for the summary
     print("  " + "   ".join(rng.choice(engine.words()) for _ in range(9)))
@@ -122,8 +138,14 @@ def build_kwargs(mode: str) -> Dict[str, object]:
     return {k: v for k, v in MODES[mode].items() if k != "blurb"}
 
 
-def default_output_path(mode: str) -> str:
-    """File name a mode writes to when `-o` is not given."""
+def default_output_path(mode: str, fmt: str = "plain") -> str:
+    """File name a mode writes to when `-o` is not given.
+
+    Every tier (and every payload layout) gets its own name, so a casual
+    `build --mode mini --format compact` can never clobber the release artifact.
+    """
+    if fmt == "compact":
+        return COMPACT_DB if mode == "default" else "urdu_database.%s.compact.gz" % mode
     return DEFAULT_DB if mode == "default" else "urdu_database.%s.txt.gz" % mode
 
 
@@ -131,10 +153,13 @@ def cmd_build(args: argparse.Namespace) -> int:
     spec = build_kwargs(args.mode)
     # Only `default` writes the shipped artifact; every other tier gets its own
     # file name so a casual `build --mode mini` can never clobber the release.
-    output = args.output or default_output_path(args.mode)
-    print("urduofdani :: build  (mode=%s - %s)" % (args.mode, MODES[args.mode]["blurb"]))
+    output = args.output or default_output_path(args.mode, args.format)
+    layout = " (compact / front-coded)" if args.format == "compact" else ""
+    print("urduofdani :: build  (mode=%s%s - %s)"
+          % (args.mode, layout, MODES[args.mode]["blurb"]))
     stats = core.build_urdu_database(
         output_path=HERE / output,
+        fmt=args.format,
         min_len=args.min_len,
         max_len=args.max_len,
         keep_diacritics=args.keep_diacritics,
@@ -302,6 +327,9 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("-o", "--output", default=None, help="output .gz path")
     build.add_argument("--min-len", type=int, default=2)
     build.add_argument("--max-len", type=int, default=40)
+    build.add_argument("--format", choices=("plain", "compact"), default="plain",
+                       help="payload layout: plain (fastest) or compact "
+                            "(front-coded, ~2.6x smaller gz, ~4.5 ms slower to load)")
     build.add_argument("--keep-diacritics", action="store_true")
     build.add_argument("--verify", action="store_true", help="verify right after building")
     build.set_defaults(func=cmd_build)

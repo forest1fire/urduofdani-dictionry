@@ -257,6 +257,17 @@ git clone https://github.com/forest1fire/urduofdani-dictionary.git
 cd urduofdani-dictionary
 ```
 
+Prefer it as an installable command? The wheel ships code only (never a stale
+copy of your data), and the dictionary is one offline command away:
+
+```bash
+pipx install .              # or: pip install .
+urduofdani build            # 15,848 words / 43.9 KB
+urduofdani build --format compact   # 15,848 words / 16.8 KB (front-coded)
+urduofdani-engine --check کتاب      # → YES کتاب
+export URDUOFDANI_DB=/path/to/urdu_database.txt.gz   # point the tools anywhere
+```
+
 ### Step 2 — Build the database (one command)
 
 ```bash
@@ -949,15 +960,17 @@ plural, gender, verb, compound and agentive stages automatically.
 ```text
 urduofdani-dictionary/
 ├── urduofdani.py              # the front door: info/build/verify/bench/search/check/…
+├── urduofdani_engine.py       # drop-in engine (UrduEngine) for your own app + CLI
 ├── build_urdu_database.py     # the whole engine: compiler + runtime + CLI (stdlib only)
+├── pyproject.toml             # packaging: console scripts urduofdani / urduofdani-engine
 ├── urdu_database.txt.gz       # default database (15,848 audited words / 43.9 KB)
 ├── urdu_database.compact.gz   # front-coded twin (15,848 words / 16.8 KB, ~6.5 ms)
 ├── urdu_database.full.txt.gz  # full build (17,539 words / 48.1 KB)
 ├── urdu_database.full.compact.gz  # front-coded full tier (17,539 words / 18.0 KB)
 ├── run_tests.py               # test runner (verbosity + -k pattern filters)
-├── tests/test_urduofdani.py   # 60 tests: orthography, morphology, sacred names, build, CLI
+├── tests/test_urduofdani.py   # 69 tests: orthography, morphology, sacred names, audit, build, CLI
 ├── examples/                  # quickstart tour + Tkinter autocomplete app
-├── tools/                     # measure_tiers.py (benchmark table) + audit_docs.py (docs audit)
+├── tools/                     # audit_words.py (word audit) · measure_tiers.py · audit_docs.py
 ├── CHANGELOG.md               # release history
 ├── ROADMAP.md                 # audit protocol and next steps
 ├── assets/
