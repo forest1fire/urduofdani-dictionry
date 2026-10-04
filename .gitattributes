@@ -1,0 +1,17 @@
+# normalise text, never touch binaries
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.svg   text eol=lf
+
+# the dictionary artifacts are opaque binaries to git
+*.gz    binary -diff
+*.png   binary
+*.jpg   binary
+
+# the generated databases should not drown review diffs
+urdu_database.txt.gz      linguist-generated=true
+urdu_database.full.txt.gz linguist-generated=true

@@ -1,0 +1,2760 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+urduofdani :: build_urdu_database.py
+====================================
+Modern High-Speed Urdu Text Engine -- Dictionary Compiler.
+
+Compiles a large, de-duplicated Urdu lexicon and serialises it using
+*Single-Space Tokenization* into ONE continuous line, then compresses that line
+into a tiny gzip binary named ``urdu_database.txt.gz``.
+
+Design goals
+------------
+* Zero third-party dependencies -> stdlib only (gzip / zlib / re / unicodedata).
+* Windows-first                 -> UTF-8 everywhere, atomic writes, no console crash.
+* Deterministic                 -> identical seeds always produce byte-identical
+                                   output (gzip MTIME is forced to 0).
+* Unlimited scaling             -> ``--max-words 0`` (default) = no cap;
+                                   ``--unlimited --depth 1-4`` = depth expansion;
+                                   ``--recall`` = raw cross product (millions).
+* Runtime friendly              -> :class:`UrduEngine` loads + indexes the DB in ms.
+
+Payload layout of the compressed database
+-----------------------------------------
+::
+
+    "اردو ہندوستان پاکستان ..."      <- ONE single line, tokens split by ONE space
+
+Rules enforced by the compiler:
+    * no newlines   * no commas   * no digits   * no punctuation   * no duplicates
+
+CLI
+---
+::
+
+    python build_urdu_database.py                          # balanced (24,589 words)
+    python build_urdu_database.py --exhaustive             # gated expansion (42,138)
+    python build_urdu_database.py --unlimited --depth 4    # unlimited (113,576)
+    python build_urdu_database.py --recall                 # raw recall (2.6M tokens)
+    python build_urdu_database.py --max-words 0            # explicitly no cap
+    python build_urdu_database.py --verify --export urdu_database.txt
+    python build_urdu_database.py --benchmark 10       # benchmark an existing .gz
+    python build_urdu_database.py --no-build --benchmark 5
+
+Author: urduofdani maintainers -- MIT License.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import codecs
+import gzip
+import hashlib
+import os
+import random
+import re
+import sys
+import tempfile
+import time
+import tracemalloc
+import unicodedata
+import zlib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Sequence, Set, Tuple
+
+__all__ = [
+    "UrduEngine",
+    "SACRED_NAMES",
+    "is_sacred_derivative",
+    "build_urdu_database",
+    "load_urdu_database",
+    "iter_urdu_words",
+    "verify_database",
+    "benchmark",
+    "canonicalize",
+    "urdu_plurals",
+    "compile_lexicon",
+]
+
+SCRIPT_VERSION = "3.1.0"
+DB_FILENAME = "urdu_database.txt.gz"
+SEPARATOR = " "
+GZIP_LEVEL = 9            # maximum deflate ratio: this is what collapses MB -> KB
+GZIP_WBITS = 31           # 31 = raw DEFLATE wrapped in a standard gzip container
+GZIP_MEMLEVEL = 9
+CHUNK_TOKENS = 25_000     # streaming join size -> flat memory even on huge builds
+
+# ---------------------------------------------------------------------------
+# 1. ORTHOGRAPHY LAYER   (canonical Urdu normalisation + phonology helpers)
+# ---------------------------------------------------------------------------
+# Arabic / Persian codepoints that Windows keyboards, PDFs and legacy databases
+# insert by accident. Folding them onto the Urdu codepoint is what keeps the
+# dictionary de-duplicated: "كتاب", "کتاب" and "كِتاب" must collapse to ONE token.
+_FOLD_MAP: Dict[int, str] = {
+    0x0622: "\u0622",   # آ  alef madda  (kept - a distinct Urdu letter)
+    0x0623: "\u0627",   # أ  -> ا
+    0x0625: "\u0627",   # إ  -> ا
+    0x0629: "\u06C1",   # ة  -> ہ
+    0x0647: "\u06C1",   # ه  -> ہ  (Arabic heh == Urdu heh)
+    0x0643: "\u06A9",   # ك  -> ک
+    0x0649: "\u06CC",   # ى  -> ی
+    0x064A: "\u06CC",   # ي  -> ی
+    0x06C0: "\u06C1",   # ۀ  -> ہ
+    0x06C2: "\u06C1",   # ۂ  -> ہ
+    0x06D3: "\u06D2",   # ۓ  -> ے
+    0x200B: "",         # zero width space      -> drop
+    0x200E: "",         # LRM                   -> drop
+    0x200F: "",         # RLM                   -> drop
+    0x0640: "",         # tatweel / kashida     -> drop
+    0x0651: "",         # shadda                -> drop
+    0x0654: "",         # hamza above           -> drop
+    0x0655: "",         # hamza below           -> drop
+    0x0670: "",         # superscript alef      -> drop
+}
+_FOLD_TABLE = str.maketrans({chr(k): v for k, v in _FOLD_MAP.items()})
+
+# Optional Arabic diacritics (harakat). Stripped by default so that
+# "کِتاب" and "کتاب" become the same token.
+_HARAKAT = re.compile(r"[\u064B-\u0650\u0652-\u0653\u0656-\u065F\u0670\u06D6-\u06ED]")
+
+# A token that is legal AFTER cleaning. Rejects digits and punctuation.
+# NOTE: the Arabic Presentation Forms blocks (U+FB50-FDFF, U+FE70-FEFF) are
+# explicitly excluded - those codepoints are isolated/initial/final glyph shapes,
+# not text. U+FE85 ("ﺅ") must never reach the database; NFKC folds it to U+0624.
+_LEGAL_TOKEN = re.compile(r"^[\u0600-\u06FF\u0750-\u077F]+$")
+_FORBIDDEN = re.compile(r"[0-9\u0660-\u0669\u06F0-\u06F9]")
+_PUNCT = re.compile(
+    r"[\s,.;:!?،؛؟٪%\-_/\\|@#$^&*+=~`'\"()\[\]{}<>«»…\u2009\u2026\u060C\u061B\u061F]"
+)
+
+# Urdu letters that behave like vowels when an affix is attached.
+_VOWEL_FINALS = "اآہیےوؤ"
+
+
+def fold_seed(word: str) -> str:
+    """Fold one seed word (NFKC + look-alike table) without stripping harakat."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFKC", word).translate(_FOLD_TABLE)).strip()
+
+
+def canonicalize(word: str, keep_diacritics: bool = False) -> str:
+    """Return the canonical Urdu form of *word* (one folded word, no junk).
+
+    Used by BOTH the compiler and the runtime loader, so a lookup performed at
+    runtime matches exactly the token that was stored at build time.
+    """
+    if not word:
+        return ""
+    # NFKC first: it folds the Arabic Presentation Forms (U+FE85 "ﺅ" -> U+0624 "ؤ",
+    # the ﻻ ligature -> لا, ...) so a seed typed with a glyph shape cannot leak
+    # into the artifact as an untypeable token.
+    word = unicodedata.normalize("NFKC", word).translate(_FOLD_TABLE)
+    if not keep_diacritics:
+        word = _HARAKAT.sub("", word)
+    word = _PUNCT.sub("", word)
+    return unicodedata.normalize("NFC", word).strip()
+
+
+def is_valid_token(token: str, min_len: int = 2, max_len: int = 40) -> bool:
+    """True when *token* is a clean, digit-free, punctuation-free Urdu word."""
+    if not (min_len <= len(token) <= max_len):
+        return False
+    if _FORBIDDEN.search(token) or _PUNCT.search(token):
+        return False
+    return bool(_LEGAL_TOKEN.match(token))
+
+
+def urdu_plurals(word: str, loanword: bool = False) -> List[str]:
+    """Generate the *grammatically produced* Urdu plural / oblique forms.
+
+    Implements the real phonological rules instead of blind suffixing:
+
+        لڑکا  -> لڑکے،  لڑکوں            (alef final: ے / وں)
+        لڑکی  -> لڑکیاں، لڑکیوں          (ye final: اں / یوں)
+        بچہ   -> بچے،   بچوں             (he final: ے / وں)
+        عورت  -> عورتیں، عورتوں          (feminine consonant: یں / وں)
+        کتاب  -> کتابیں، کتابوں          (masculine consonant: یں / وں)
+        فائل  -> فائلیں، فائلوں          (loanword, feminine reading)
+        لنک   -> لنکس،  لنکوں            (loanword: ز is the modern Urdu plural)
+    """
+    if len(word) < 2:
+        return []
+    out: List[str] = []
+
+    if loanword:
+        if len(word) < 3 and word not in SHORT_LOAN_OK:
+            return []                            # "اپ" -> "اپس"، "آن" -> "آنز" is junk
+        if not word.endswith(("ی", "ہ", "ا")):
+            out.append(word + "س")                   # لنکس، نوٹس، اسٹیشنس (press style)
+            out.append(word + "ز")                   # کمپیوٹرز، سرورز، ٹریلرز (variant)
+        out.append(word + "وں")                      # موبائلوں، فائلوں
+        if word[-1] in "فلہنمیے":
+            out.append(word + "یں")                  # فائلیں، ایپس -> ایپیں (rare)
+        return _dedupe(out)
+
+    last = word[-1]
+    if last == "ا" and word.endswith("یا"):
+        stem = word[:-1]                                          # چڑی، دنی
+        out += [word + "ں", stem + "وں"]                           # چڑیاں، چڑیوں / دنیاں، دنیوں
+    elif last == "ا":
+        out += [word[:-1] + "ے", word[:-1] + "وں"]    # لڑکا -> لڑکے، لڑکوں
+    elif last in "یے":
+        out += [word + "اں", word[:-1] + "یوں"]       # لڑکی -> لڑکیاں، لڑکیوں
+    elif last == "ہ":
+        if len(word) > 1 and word[-2] in "اآویے":       # گاہ/راہ/پناہ keep the ہ
+            out += [word + "یں", word + "وں"]           # گاہیں، گاہوں
+        else:                                          # کمرہ -> کمرے، کمروں
+            out += [word[:-1] + "ے", word[:-1] + "وں"]
+    elif last == "ں":
+        out += [word[:-1] + "ئیں", word[:-1] + "اؤں"]              # ماں -> مائیں، مااؤں
+    elif last == "و":
+        out += [word + "ں"]
+    elif last in "تٹ":
+        out += [word + "یں", word + "وں"]             # عورت، چوٹ (feminine)
+    else:
+        out += [word + "وں"]
+        if last in "نمرکلبشف":                        # producible -یں family
+            out.append(word + "یں")
+        else:
+            out.append(word + "یں")
+    return _dedupe(out)
+
+
+# The only two-letter loanwords whose press plural is real Urdu ("ٹچز").
+SHORT_LOAN_OK: Set[str] = {"ٹچ"}
+
+
+# Endings that mean "this is already an inflected form": the plural, oblique and
+# derivative stages must never run on such a seed again. Kept in one place so the
+# rule cannot drift between stages (that is how "جوتےاں" and "بازؤنوں" appeared).
+_INFLECTED_ENDINGS: Tuple[str, ...] = ("وں", "یں", "اں", "ات", "ے", "ؤں")
+
+
+# Sections whose words are grammatical glue, names or titles: they have no
+# plural form, so the plural stage must never touch them ("اے" -> "اےاں" was junk).
+NON_PLURAL_SECTIONS: Set[str] = {
+    "function", "number", "proper", "name", "allah", "nabi", "ahlbayt", "sahaba",
+}
+
+
+# Singular words that merely *look* inflected (they end in a plural marker but
+# are dictionary entries in their own right).
+_SINGULAR_LOOKALIKES: Set[str] = {
+    "ماں", "ہاں", "دھواں", "اماں", "پاؤں", "گاؤں", "چاؤں", "ناں", "کاں", "جہاں",
+    "کہاں", "یہاں", "وہاں", "دھیان", "عنوان", "مہمان", "آسان", "جوان", "زبان",
+    "بیان", "عیان", "روان", "سامان", "نادان", "انجان", "نمایاں", "تاباں",
+}
+
+_INFLECTED_SEED_CACHE: Set[str] = set()
+
+
+def _inflected_seed_forms() -> Set[str]:
+    """Every form the plural rules can derive from the curated banks.
+
+    Built lazily from the seed banks themselves, so "this seed is already a
+    plural" is *derived*, not guessed from its spelling: جوتے, دکانوں, بکریاں and
+    بازؤں are recognised, while ماں, گاؤں and سامان (singulars that happen to end
+    in a plural-looking sequence) are not.
+    """
+    if not _INFLECTED_SEED_CACHE:
+        for entries in LexiconForge()._base_sections().values():      # noqa: SLF001
+            for entry in entries:
+                for raw in entry.split():
+                    word = fold_seed(raw)
+                    if len(word) < 2:
+                        continue
+                    _INFLECTED_SEED_CACHE.update(urdu_plurals(word))
+                    _INFLECTED_SEED_CACHE.update(urdu_plurals(word, loanword=True))
+    return _INFLECTED_SEED_CACHE
+
+
+def _already_inflected(word: str) -> bool:
+    """True when *word* is (or looks like) an inflected form, not a base word."""
+    if word in _SINGULAR_LOOKALIKES:
+        return False
+    if word in _inflected_seed_forms():
+        return True
+    return word.endswith(_INFLECTED_ENDINGS)
+
+
+def _pluralizable(word: str, section: str = "") -> bool:
+    """False for seeds that are already plural / oblique, or grammatically fixed.
+
+    "جوتے", "دکانوں" and "بکریاں" are stored as dictionary entries, but the
+    plural stage must not run on them again (otherwise the forge invents
+    "جوتےاں" or "بکریاںی"). Function words, numbers and names take no plural
+    either - that is how "اےاں" and "کوےاں" used to appear.
+
+    Two-letter *content* words stay pluralizable on purpose: دل -> دلوں,
+    خط -> خطیں, غم -> غموں are real Urdu, and losing them was a regression the
+    word audit caught.
+    """
+    if len(word) < 2 or section in NON_PLURAL_SECTIONS:
+        return False
+    return not _already_inflected(word)
+
+
+# Derivational tails. A word that already carries one of them must not take a
+# second one: "فنکار" + "گر" is not a word, and neither is "دکاندار" + "دار".
+_AGENTIVE_TAILS: Tuple[str, ...] = (
+    "دار", "مند", "کار", "دان", "فروش", "ساز", "گر", "بان", "والا", "والی",
+)
+
+
+def _stackable(base: str, suffix: str) -> bool:
+    """False when *suffix* would repeat a derivational tail the base already has."""
+    if not base.endswith(_AGENTIVE_TAILS):
+        return True
+    if base + suffix in KEEP_FORMS:              # workگر, کارگر-style exceptions
+        return True
+    # a tail may follow a *different* tail only when the result is listed above
+    for tail in _AGENTIVE_TAILS:
+        if base.endswith(tail):
+            return suffix == tail and False
+    return True
+
+
+def _derivable(word: str) -> bool:
+    """True when *word* may receive a derivational suffix or compound head.
+
+    Urdu builds "کتاب" + "دان" and "پھول" + "والا", but never attaches a head to
+    an inflected stem: "کیفے" is the oblique of کیفہ, so "کیفےدان" is not a word.
+    """
+    return len(word) >= 3 and not _already_inflected(word)
+
+
+# Inflection markers that must never attach to a sacred name.
+_INFLECTION_MARKERS: Tuple[str, ...] = ("وں", "یں", "اں", "ات", "ے", "ؤں")
+
+
+def _sacred_set() -> Set[str]:
+    """Canonical form of every sacred name (Allah, Anbiya, Ahl al-Bayt, Sahaba)."""
+    blob = " ".join((ALLAH_NAMES, NABI_NAMES, AHL_BAYT_NAMES, SAHABA_NAMES))
+    return {w for w in (canonicalize(t) for t in blob.split()) if w}
+
+
+# Nominalisers that turn a person's *name* into nonsense ("نبیپن", "محمدگی").
+# They are blocked on a sacred stem exactly like the inflection markers; the
+# everyday -ی / -یت forms (آدمی، کریمی، محمدیت) are real words and stay.
+_SACRED_JUNK_SUFFIXES: Tuple[str, ...] = ("پن", "گی", "اوٹ", "ائی")
+
+# Real words that happen to look like a sacred name + junk suffix.
+SACRED_DERIVATIVE_EXCEPTIONS: Set[str] = {"حیائی"}
+
+
+# Sacred names that are *also* ordinary Urdu vocabulary (homographs). For these
+# the everyday reading wins: "ملکوں" (countries), "شہیدوں" (martyrs),
+# "مقدمے" (lawsuits) and "برے" (oblique of برا) are real words, so the
+# never-inflect guard must not delete them. Proper names - اللہ، محمد، علی،
+# حسن، حسین، فاطمہ، مریم، نوح، ابراہیم and the rest - stay fully protected.
+SACRED_HOMOGRAPH_STEMS: Set[str] = {
+    "اول", "بر", "ثابت", "حق", "حلیم", "حمد", "حکم", "حکیم", "رسالت",
+    "شہید", "عمر", "مقدم", "ملک", "ولی", "وکیل",
+}
+
+
+def is_sacred_derivative(token: str) -> bool:
+    """True when *token* is a sacred name carrying a plural/case inflection.
+
+    The compiler uses this to guarantee that the dictionary can never contain
+    "اللہوں", "محمدوں" or "علیوں": sacred names are stored exactly as written
+    and are never pluralised, suffixed, prefixed or compounded.
+    """
+    if not SACRED_NAMES:
+        return False
+    # canonicalise first: the guard must also hold for --keep-diacritics builds
+    token = canonicalize(token)
+    if not token or token in SACRED_NAMES:
+        return False
+    if token in SACRED_DERIVATIVE_EXCEPTIONS:
+        return False
+    for marker in _INFLECTION_MARKERS + _SACRED_JUNK_SUFFIXES:
+        if token.endswith(marker) and len(token) > len(marker):
+            stem = token[:-len(marker)]
+            if stem in SACRED_NAMES and stem not in SACRED_HOMOGRAPH_STEMS:
+                return True
+    return False
+
+
+def _is_sorted(items: Sequence[str]) -> bool:
+    """True when *items* is strictly ascending (the forge already guarantees it)."""
+    return all(a < b for a, b in zip(items, items[1:]))
+
+
+def _dedupe(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def attach_suffix(word: str, suffix: str) -> str:
+    """Attach a derivational suffix with the orthographic guards.
+
+    A stem that ends in the nasal ں never takes a bare -ی: the real forms are
+    built from the nasal-free stem (دھواں -> دھویں) or not at all.
+    """
+    if suffix in ("ی", "ئی") and word.endswith("ں"):
+        return ""
+    """Attach a derivational suffix using Urdu orthographic rules.
+
+    Handles the cases where a naive ``word + suffix`` would be misspelled:
+
+        دریا + ی  -> دریائی      (not دریای)
+        ہوا  + ی  -> ہوائی
+        بڑا  + پن -> بڑاپن
+        پانی + ی  -> (skipped, would create "پانیی")
+    """
+    if not suffix or len(word) < 2:
+        return ""
+    if word.endswith(suffix):                 # avoid "دوستتی" / "کتابب"
+        return ""
+    if suffix in _AGENTIVE_TAILS and not _stackable(word, suffix):
+        return ""
+    last = word[-1]
+    if suffix == "ی":
+        if last in "یے":
+            return ""
+        if last == "ا":
+            return word[:-1] + "ائی"      # دریا -> دریائی، ہوا -> ہوائی، دعا -> دعائی
+        if last in "ہۂ":
+            return ""
+    if suffix[0] == last and last not in "او":  # double-letter guard
+        return ""
+    # vowel-initial suffix after a vowel-final stem needs a glide: skip rather
+    # than invent "پوداانہ" / "دنیاات"
+    if suffix[0] in "اآ" and last in "اآہیےو":
+        return ""
+    if suffix[0] == "ہ" and last in "ہیے":
+        return ""
+    return word + suffix
+
+
+# ---------------------------------------------------------------------------
+# 2. CURATED LEXICON   (hand-written seed vocabulary, grouped by category)
+# ---------------------------------------------------------------------------
+# Each section is a space-delimited blob of real Urdu words. The section name
+# decides which morphology the forge is allowed to apply (see RULES below).
+
+FUNCTION_WORDS: str = (
+    # pronouns, postpositions, conjunctions, question words, emphatics
+    "میں ہم تم آپ وہ یہ ہمارا ہمارے ہماری میرا میرے میری تیرا تیرے تیری "
+    "آپکا آپکے آپکی اپنا اپنے اپنی خود خودی کون کیا کیوں کب کہاں کیسے کیسا کیسی "
+    "کتنا کتنی کتنے اور یا لیکن مگر اگر تو پھر بھی نہ نہیں ہاں جی ٹھیک ٹھاک "
+    "اچھا اچھی اچھے برا بری برے بہت زیادہ کم تھوڑا تھوڑی تھوڑے سارا ساری سارے سب "
+    "کوئی کچھ ہر کبھی ہمیشہ اکثر شاید ضرور بالکل واقعی سچ جھوٹ مطلب یعنی "
+    "کیونکہ تاکہ جیسا جیسی جیسے ویسا ویسی ویسے اتنا اتنی اتنے "
+    "جہاں وہاں یہاں ادھر ادھر جدھر کدھر جب تک بغیر ساتھ لیے بنا "
+    "کے کی کا کو سے نے پر تلک تک ہی بھی تو نا ناں ذرا ذرہ صرف محض بھر "
+    "کاش افسوس خیر بھلا چلو آؤ چلئے دیکھیں سنیں جی ہاں نہیں ٹھیک ہے "
+)
+
+NUMBER_WORDS: str = (
+    # digits are illegal in the DB -> numbers live here as WORDS
+    "ایک دو تین چار پانچ چھ سات آٹھ نو دس گیارہ بارہ تیرہ چودہ پندرہ سولہ سترہ "
+    "اٹھارہ انیس بیس اکیس بائیس تئیس چوبیس پچیس چھبیس ستائیس اٹھائیس انتیس تیس "
+    "اکتیس بتیس تینتیس چونتیس پینتیس چھتیس سینتیس اڑتیس انتالیس چالیس اکتالیس "
+    "بیالیس تینتالیس چوالیس پینتالیس چھیالیس سینتالیس اڑتالیس انچاس پچاس اکاون "
+    "باون ترپن چون پچپن چھپن ستاون اٹھاون انسٹھ ساٹھ اکسٹھ باسٹھ ترسٹھ چونسٹھ "
+    "پینسٹھ چھیاسٹھ سڑسٹھ اڑسٹھ انہتر ستر اکہتر بہتر تہتر چوہتر پچہتر چھہتر ستتر "
+    "اٹھہتر اناسی اسی اکیاسی بیاسی تراسی چوراسی پچاسی چھیاسی ستاسی اٹھاسی نواسی "
+    "نوے اکانوے بانوے ترانوے چورانوے پچانوے چھیانوے ستانوے اٹھانوے ننانوے سو "
+    "ہزار لاکھ کروڑ ارب کھرب پہلا دوسرا تیسرا چوتھا پانچواں چھٹا ساتواں آٹھواں "
+    "نواں دسواں آدھا پاؤ چوتھائی تہائی دوگنا تگنا چوگنا نصف فیصد "
+)
+
+TIME_WORDS: str = (
+    "آج کل پرسوں ابھی پہلے بعد جلد دیر صبح سویرے دوپہر شام رات راتوں دن دنوں "
+    "ہفتہ ہفتے مہینہ مہینے سال سالوں گھنٹہ گھنٹے منٹ سیکنڈ لمحہ لمحے وقت وقتی "
+    "وقتاً تاریخ تاریخی صدی عرصہ مدت مرحلہ موقع موقعہ موقعوں آغاز اختتام "
+    "پیر منگل بدھ جمعرات جمعہ ہفتوار اتوار جنوری فروری مارچ اپریل مئی جون جولائی "
+    "اگست ستمبر اکتوبر نومبر دسمبر موسم بہار گرمی خزاں سردی برسات شادی عید رمضان "
+    "محرم شب قدر چاند رات سالگرہ یوم تہوار تعطیل چھٹی"
+)
+
+NATURE_WORDS: str = (
+    "پانی ہوا آگ مٹی زمین آسمان ستارہ ستارے چاند سورج کہکشاں بادل باد بارش برف "
+    "اولے طوفان زلزلہ سیلاب روشنی چراغ اندھیرا سایہ دریا سمندر جھیل ندی چشمہ "
+    "کنواں پہاڑ پہاڑی وادی صحرا جنگل درخت پتہ پتے جڑ پھول پھل بیج گھاس باغ "
+    "باغیچہ کھیت فصل پتھر چٹان ریت سونا چاندی لوہا تانبا پیتل جست کوئلہ تیل گیس "
+    "بجلی توانائی دھوپ چھاؤں کہر دھند نمی خشکی سیل ریتلا مٹیالا بادلوں بادل "
+    "شبنم اولہ ژالہ باری تودہ لاوہ راکھ چنگاری شعلہ شعلے دھواں بھاپ کائی "
+    "پرندہ پرندے جانور جانوروں کیڑا مکھی مچھر مکڑی چیونٹی شہد مکھی تتلی بھونرا "
+    "شیر شیروں بھیڑیا لومڑی خرگوش ہرن چیتا ریچھ بندر گدھا گھوڑا اونٹ ہاتھی "
+    "گائے بیل بکری بھینس کتا بلی چوہا چوہے بطخ مرغی مرغا کبوتر کوے طوطا مینا "
+    "چڑیا عقاب باز الو مچھلی کچھوا سانپ مگرمچھ شیر کیکڑا جھینگا سیپ موتی "
+)
+
+PLACE_WORDS: str = (
+    "گھر گھروں مکان دالان چھت صحن کمرہ کمرے دروازہ دروازے کھڑکی دیوار فرش "
+    "زینہ سیڑھی چابی تالا بازار دکان دفتر مدرسہ اسکول کالج یونیورسٹی ہسپتال "
+    "کلینک دواخانہ مسجد مندر گرجا گوردوارہ قبرستان پارک میدان سڑک گلی شاہراہ "
+    "پل چوک اسٹیشن اڈہ بندرگاہ ریلوے بس ٹرین ٹیکسی رکشہ سائیکل موٹرسائیکل گاڑی "
+    "کار جہاز کشتی گاؤں شہر ملک سرحد صوبہ ضلع تحصیل ریاست دارالحکومت "
+)
+
+PROPER_NOUNS: str = (
+    # names are stored as-is: they are never pluralised or suffixed
+    "پاکستان ہندوستان ایران افغانستان ترکی چین عرب امریکہ انگلستان لندن دہلی "
+    "لاہور کراچی اسلام آباد پشاور کوئٹہ ملتان فیصل آباد حیدرآباد راولپنڈی "
+    "گوجرانوالہ سیالکوٹ بہاولپور سکھر جھنگ مظفرآباد ایبٹ آباد ڈیرہ اسماعیل خان "
+    "مکہ مدینہ بغداد قاہرہ دمشق استنبول تہران کابل ٹوکیو بیجنگ ماسکو پیرس "
+    "نیویارک واشنگٹن ٹورنٹو سڈنی دبئی ابوظبی دوحہ ریاض جدہ کویت مسقط "
+    "اردو پنجابی سندھی پشتو بلوچی سرائیکی کشمیری ہندکو "
+)
+
+PERSON_WORDS: str = (
+    "ماں باپ والد والدہ والدین بیٹا بیٹی بیٹے اولاد بچہ بچی بچے بھائی بہن دادا "
+    "دادی نانا نانی پوتا پوتی نواسہ نواسی چچا چچی تایا تائی ماموں مامی خالہ خالو "
+    "سسر ساس سالا سالی بھتیجا بھتیجی بھانجا بھانجی شوہر بیوی میاں بیگم زوجین "
+    "خاندان رشتہ رشتے دوست دوستی دوستوں دشمن پڑوسی اجنبی مہمان انسان آدمی عورت "
+    "مرد بچپن جوانی بڑھاپا بزرگ نوجوان لڑکا لڑکی لڑکے ٹیچر استاد شاگرد طالب "
+    "انجینئر ڈاکٹر نرس وکیل جج صحافی مصنف شاعر ادیب پروفیسر پرنسپل منیجر "
+    "اکاؤنٹنٹ کلرک درزی موچی بڑھئی لوہار سنار کمہار کسان مزدور ملازم کاریگر "
+    "ہنرمند ماہر مشیر ناظم ڈائریکٹر افسر سپاہی جرنیل سیاستدان وزیر صدر گورنر "
+    "شہری دیہاتی پنڈت مولوی قاری حافظ خطیب امام مبلغ کارکن رہنما لیڈر "
+)
+
+BODY_WORDS: str = (
+    "سر آنکھ آنکھیں کان ناک منہ ہونٹ دانت زبان گلا گردن کندھا بازو ہاتھ ہتھیلی "
+    "انگلی انگلیاں ناخن سینہ دل جگر معدہ پیٹ کمر ران گھٹنا ٹخنہ پاؤں پیر خون "
+    "گوشت ہڈی ہڈیاں جلد بال رگ دماغ یاد حافظہ نیند خواب تھکن درد بخار زکام "
+    "کھانسی نزلہ پھیپھڑے صحت تندرستی بیماری مرض علاج دوا دوائیں دوادارو ٹیکہ "
+    "ویکسن آپریشن سرجری مریض طبیب حکیم جراح تشخیص نسخہ پرچہ شفاخانہ "
+    "دھڑکن سانس آنکھوں ہاتھوں پاؤں پیروں کانوں دانتوں "
+)
+
+FOOD_WORDS: str = (
+    "روٹی روٹیاں نان چاول سالن گوشت مرغی مچھلی انڈا انڈے سبزی سبزیاں پھل پھلوں "
+    "سیب آم کیلا انگور انار تربوز خربوزہ مالٹا سنگترہ لیموں امرود آلو پیاز ٹماٹر "
+    "بھنڈی بینگن کدو گاجر مولی شلجم پالک میتھی دھنیا پودینہ ادرک لہسن مرچ نمک "
+    "ہلدی زیرہ دار چینی الائچی لونگ سویا تیل گھی مکھن دہی لسی چھاچھ دودھ چائے "
+    "کافی قہوہ شربت جوس ناشتہ کھانا میٹھا نمکین ترش کڑوا کھٹا مزہ ذائقہ بھوک "
+    "پیاس پیالہ پلیٹ چمچ چاقو کٹورا برتن توا کڑاہی پتیلی چولھا اوون فرج "
+    "بسکٹ کیک پیسٹری بریانی قورمہ کباب سموسہ پکوڑا حلوا کھیر فالودہ ریتھا "
+    "چٹنی اچار مربہ شہد چینی گڑ کھویا پنیر دہی مکئی جوار باجرہ چنا مسور ماش "
+)
+
+HOUSEHOLD_WORDS: str = (
+    "کرسی میز صوفہ پلنگ بستر تکیہ چادر رضائی کمبل قالین پردہ شیشہ بلب پنکھا "
+    "کولر ہیٹر استری ویکیوم جھاڑو پوچا صابن شیمپو تولیہ کنگھی آئینہ قینچی "
+    "سوئی دھاگہ کپڑا رسی تار کیل ہتھوڑا کلہاڑی آری رندھ پیچکاسہ چابیاں ڈبہ "
+    "تھیلا بوری ٹوکری بوتل گلاس جھاگ کچرا کوڑا دان ٹوٹی گملہ چمنی شمع "
+)
+
+CLOTHING_WORDS: str = (
+    "لباس کپڑے قمیض شلوار پاجامہ کرتا دوپٹہ چادر شال سوٹ کوٹ پتلون شرٹ ٹائی "
+    "جیکٹ سویٹر ٹوپی ٹوپیاں پگڑی جوتا جوتے چپل سینڈل موزہ دستانے رومال بیگ "
+    "بٹوہ چوڑی کنگن انگوٹھی ہار زیور جھمکے ٹوپی والا ریشم اون کپاس لینن "
+)
+
+ABSTRACT_WORDS: str = (
+    "خوشی غمی غم دکھ تکلیف آرام سکون سکون پریشانی فکر تشویش امید ناامیدی مایوسی "
+    "محبت پیار عشق نفرت حسد رحم غصہ ہنسی مسکراہٹ آنسو دعا شکر صبر ایمان عقیدہ "
+    "عبادت نماز روزہ زکات حج قربانی قرآن حدیث سنت نبی رسول اللہ خدا رب بندگی "
+    "تقوی نیکی بدی ثواب گناہ توبہ جنت دوزخ فرشتہ شیطان روح نفس شعور لاشعور "
+    "ہنر فن ادب شاعری شعر غزل نظم کہانی افسانہ ناول ڈراما تصویر رنگ موسیقی راگ "
+    "نغمہ گیت آواز خاموشی زبان لہجہ لفظ جملہ عبارت مضمون مطلب ترجمہ لغت قاموس "
+    "قواعد املا خط کتاب رسالہ حروف تہجی محاورہ کہاوت ضرب مثل خیال تصور خواب "
+    "حقیقت حیرت تعجب خوف ڈر ہمت بزدلی غرور انکساری تواضع اخلاق کردار دیانت "
+    "ایمانداری خودی غیرت حمیت عزت ذلت شان وقار احترام تعظیم الفت چاہت لگن جنون "
+    "فراق وصال ہجر جدائی ملاپ یاس توقع یقین بھروسہ اعتماد شک گمان وسوسہ ظن "
+    "سچائی جھوٹائی صداقت وفا بےوفائی ہمدردی غمخواری خیر خیرات نیکی ثواب "
+    "دوزخی جنت والا علم دانش بینش بصیرت فراست ذہانت حافظہ یادداشت توجہ "
+    "یکسوئی محنت کوشش جدوجہد لگن مستقل مزاجی عادت خصلت فطرت مزاج طبیعت "
+    "جذبہ احساس کیفیت کیف مستی نشہ سرشاری وجدان الہام وحی کرامت معجزہ "
+)
+
+ADJECTIVE_WORDS: str = (
+    "بڑا چھوٹا لمبا چوڑا گہرا اونچا نیچا نیا پرانا نوجوان بوڑھا تازہ سست تیز "
+    "آہستہ نرم سخت کھردرا گرم ٹھنڈا سوکھا گیلا صاف گندا خالص کھلا بند خالی بھرا "
+    "ہلکا بھاری سستا مہنگا خوبصورت بدصورت پیارا معصوم شریف بدتمیز عقلمند دانا "
+    "بیوقوف سمجھدار ہوشیار چالاک بہادر ڈرپوک سچا جھوٹا وفادار بے وفا مہربان "
+    "سنگدل خوش مزاج بدمزاج محنتی کمزور طاقتور صحت مند بیمار زندہ مردہ تھکا "
+    "بھوکا پیاسا امیر غریب تنگ دست خوش حال دل کش دلچسپ بور اچھا برا بہترین "
+    "بہتر اعلیٰ ادنیٰ خاص عام آسان مشکل ممکن ناممکن ضروری اہم معمولی مفید مضر "
+    "جائز ناجائز حلال حرام پاک نجس ادھورا پورا ادھیڑ پکا کچا میٹھا تلخ شیریں "
+    "چمکدار رنگین بے رنگ بے نام بے کار بے بس بے حال بے خبر بے شمار بے شمار "
+    "لاپرواہ لاچار بے چارہ کامیاب ناکام مشہور نامعلوم معلوم واضح مبہم گہرا "
+)
+
+COLOR_WORDS: str = (
+    "رنگ رنگوں سفید کالا سرخ لال نیلا سبز پیلا نارنجی بھورا خاکی گلابی جامنی "
+    "سنہری چاندی سرمئی فیروزی زیتونی آسمانی گہرا ہلکا چمکیلا شفاف دھندلا "
+    "دائرہ گول چوکور مستطیل مثلث کونہ لکیر نقطہ شکل صورت ہیئت "
+)
+
+SOCIETY_WORDS: str = (
+    "حکومت سرکار وزیراعظم صدر گورنر پارلیمنٹ اسمبلی عدالت جج وکیل مقدمہ قانون "
+    "آئین حقوق فرض شہریت قومی بین الاقوامی انتخابات ووٹ جماعت تحریک احتجاج "
+    "ہڑتال انصاف ظلم جیل پولیس فوج دفاع حملہ جنگ امن معاہدہ تجارت کاروبار "
+    "کمپنی فرم ملازم تنخواہ اجرت منافع نقصان سرمایہ بینک رقم پیسہ پیسے کرنسی "
+    "ڈالر روپیہ ادھار قرض سود منڈی قیمت خریداری فروخت سودا بچت بجٹ حساب "
+    "محصول ٹیکس شہرت کامیابی ناکامی ترقی زوال اخبار رسالہ چینل ریڈیو نشریات "
+    "اشتہار تشہیر خبر خبریں واقعہ حادثہ جرم سزا قیدی عدالتی فیصلہ اپیل پٹیشن "
+)
+
+EDUCATION_WORDS: str = (
+    "تعلیم استاد شاگرد سبق امتحان نمبر رزلٹ ڈگری سند داخلہ فارم فیس کلاس "
+    "جماعت نصاب لائبریری مطالعہ تحقیق مقالہ پی ایچ ڈی علم ہنر فن ادب شاعری "
+    "شعر غزل نظم کہانی افسانہ ناول ڈراما فلم تصویر تصاویر موسیقی راگ نغمہ گیت "
+    "آواز خاموشی زبان لہجہ لفظ جملہ عبارت مضمون مطلب ترجمہ لغت قاموس قواعد "
+    "املا خط کتاب کتابیں رسالہ اخبار حروف تہجی محاورہ کہاوت ضرب مثل تاریخ "
+    "جغرافیہ ریاضی سائنس طبیعیات کیمیا حیاتیات معاشیات نفسیات فلسفہ منطق "
+    "انگریزی اردو عربی فارسی ہندی سنسکرت "
+)
+
+TECH_WORDS: str = (
+    "کمپیوٹر موبائل فون ٹیبلٹ اسمارٹ اسکرین مانیٹر کیبورڈ ماؤس پرنٹر "
+    "اسکینر اسپیکر ہیڈفون مائیک ویبکیم کیمرہ چارجر بیٹری پاور کیبل کنیکشن "
+    "سگنل نیٹ ورک انٹرنیٹ وائی فائی بلوٹوتھ ہاٹ اسپاٹ ڈیٹا سرور کلائنٹ ہوسٹنگ "
+    "ڈومین ویب سائٹ براؤزر صفحہ سرچ انجن کوکی کیش میموری اسٹوریج ڈرائیو "
+    "فلیش یو ایس بی فائل فولڈر ڈاکومنٹ پی ڈی ایف ورڈ ایکسل پریزنٹیشن سافٹ ویئر "
+    "ہارڈ ویئر پروگرام پروگرامر پروگرامنگ کوڈ کوڈنگ اسکرپٹ لائبریری فریم ورک "
+    "ورژن اپڈیٹ اپگریڈ بگ ایرر لاگ ان اکاؤنٹ یوزرنیم پاس ورڈ پروفائل "
+    "سیٹنگ سیٹنگز آپشن مینو بٹن آئیکن ٹیب ونڈو نوٹیفکیشن الرٹ ڈاؤن لوڈ اپ لوڈ "
+    "اسٹریم اسٹریمنگ ویڈیو آڈیو پوڈکاسٹ پلے لسٹ ای میل پیغام پیغامات چیٹ "
+    "چیٹنگ چیٹبوٹ واٹس ایپ فیس بک ٹویٹر انسٹاگرام یوٹیوب گوگل مائیکروسافٹ "
+    "ایپل اینڈرائیڈ ونڈوز لینکس ایپلیکیشن انسٹال انسٹالر پیکج زپ "
+    "کلاؤڈ کمپیوٹنگ ورچوئل ڈیجیٹل مشین لرننگ ڈیپ لرننگ نیورل الگورتھم ماڈل "
+    "ٹریننگ مصنوعی ذہانت روبوٹ روبوٹکس آٹومیشن خودکار سینسر پروسیسر چپ سرکٹ "
+    "ٹیکنالوجی ٹیک سائبر سیکیورٹی ہیکر وائرس اینٹی وائرس فائر وال انکرپشن "
+    "توثیق بلاکچین کرپٹو کرنسی ٹوکن والٹ ٹرانزیکشن ادائیگی آن لائن "
+    "لائیو ایمپلیفائر سیٹلائٹ نیویگیشن نقشہ مقام پلیٹ فارم "
+    "مارکیٹ پلیس ڈلیوری ٹریکنگ رسید بل پرچی ڈسکاؤنٹ آفر کیش بیک "
+    "موبائل بینکنگ بیکاپ ری اسٹارٹ ٹول بار اسکرین شاٹ "
+)
+
+SPORT_WORDS: str = (
+    "کھیل کھلاڑی ٹیم میچ مقابلہ اننگز رن وکٹ گیند بلا بیٹ بولر بلے باز کرکٹ "
+    "ہاکی فٹبال ٹینس بیڈمنٹن شطرنج تیراکی کشتی دوڑ میراتھن اولمپک تمغہ انعام "
+    "جیت شکست ٹرافی کوچ ریفری اسٹیڈیم گراؤنڈ پچ میدان کپتان ریاضیات "
+    "اداکار اداکارہ ہدایت کار ٹکٹ شو تقریب جشن میلہ شادی ولیمہ منگنی ماتم "
+    "جنازہ دعوت ضیافت تحفہ تحائف مبارکباد تعزیت خوشی غمی "
+)
+
+# Second seed tier - extra domain vocabulary merged into the sections above.
+ADDITIONAL_SEEDS: Dict[str, str] = {
+    "nature": (
+        "پیپل نیم برگد بیری کیکر ٹہنی شاخ شاخیں پتوں جڑوں بیجوں چراگاہ سبزہ "
+        "جنگلات زرافہ زیبرا ہرن سانپوں ازگر کوبرا مگرمچھ جھینگے کیکڑے سیپ مرجان "
+        "مینڈک چھپکلی گرگٹ ریچھ بندر گوریلا کینگرو کوآلا پانڈا خچر بیل بھینسیں "
+        "بکریاں بھیڑیں مرغیاں مرغے بطخیں کبوتروں طوطے کویل بلبل مینا فاختہ مور "
+        "مورنی شکرا الوں چمگادڑ تتلیاں مکھیاں مکڑیاں چیونٹیاں بھڑ ٹڈا کھٹمل "
+        "بگلا ہنس ہنسوں بازوں شہد گھونسلہ انڈے دھوپ ہیٹ وار رِم جھیم بوندا باندی "
+        "بدلیاں چاندنی ستاروں سیارہ سیارے خلاء خلا کہکشائیں شہاب ثاقب نظام شمسی "
+    ),
+    "place": (
+        "دروازوں کھڑکیاں دیواریں چھتیں صحنوں کمرے محراب گنبد مینار عمارت عمارتیں "
+        "بلند عمارت ہوٹل ریسٹورنٹ ریسٹورانٹ کیفے چائے خانہ کتب خانہ عجائب گھر "
+        "چڑیا گھر میوزیم تھانہ چوکی عدالت خانہ دفتروں فیکٹری کارخانہ ورکشاپ "
+        "گودام منڈیاں بازارچہ پھاٹک چوکیداری برگ پلازہ مال اسٹاپ پٹرول پمپ "
+        "بس اسٹاپ ٹرمینل ایرپورٹ ایئرپورٹ گودی بندرگاہیں کشتیاں جہازوں ریلوے "
+        "کوہستان پہاڑیاں وادیاں دریاﺅں ساحلوں جزیرہ جزیرے جنگل گھاٹی میدان "
+        "کھیت کھلیان گاؤں گاؤں والا دیہات محلہ گلی کوچے سڑکیں گزرگاہ شاہراہیں "
+    ),
+    "food": (
+        "کچوری سموسے پکوڑے دہی بڑے چھولے چنے لوبیا راجما سرسوں متھرا چکی کی روٹی "
+        "تندوری نان کلچہ پراٹھا پوری بھٹورا ڈبل روٹی کیک بسکٹ ٹافیاں مٹھائی "
+        "رس گلہ گلاب جامن برفی لڈو جلیبی پاپڑی سوہان حلوہ پوری کھیر فرنی کسٹرڈ "
+        "جلیبیاں کھویا ملائی ربڑی پنیر دہی لسی چھاچھ شربت ٹھنڈا لسی ٹھنڈائی "
+        "انار دانہ گڑ والا چینی والا نمکین بسکٹ چرمرا چنا زردہ بریانی پلاؤ "
+        "کڑھی نہاری حلیم کبابوں کوفتہ ٹکہ کھیرا سلاد رائتہ چٹنی"
+    ),
+    "household": (
+        "چابیوں تالے ہتھوڑے کلہاڑی آریاں پیچکسیں ڈبوں ٹوکریاں بوتلیں گلاسوں "
+        "تھرموس فلیسک چولہے اوون میں ٹوسٹر بلینڈر مکسچر گرائنڈر جوسر کیتلی "
+        "سماور چائے دانی پیالی طشتری چمچے کانٹے چھری کدوکش چھلنی سال گرنی "
+        "پیمانہ ترازو میٹر گھڑی دیواری گھڑی ساعت الارم سوئیاں دھاگے کپڑے "
+        "قینچیاں استری بجلی استری جھاڑو پوچے بالٹی مغز صابن دان تولیے رومال "
+    ),
+    "clothing": (
+        "کرتے پاجامے شلواروں قمیضوں دوپٹے چادریں شالیں سوٹنگ کوٹوں جیکٹیں "
+        "سویٹرز ٹوپیوں پگڑیاں جوتوں چپلوں سینڈل موزے دستانے بٹوے چوڑیاں کنگن "
+        "انگوٹھیاں ہاروں زیورات جھمکے بالیاں نتھ ناک کی نتھ پازیب بندھن "
+        "ریشمی اونی کپاس والا لینن بنناں دھوتی پٹکا صدری واسکٹ شلوار قمیض "
+    ),
+    "body": (
+        "پلکیں بھنوﺅں ماتھا کندھے بازﺅں کہنیاں گھٹنے ٹخنے ایڑیاں پنجے "
+        "ہتھیلیاں انگلی کے نشان ناخنوں رگوں شریانیں پٹھے عضلات حرام مغز ریڑھ "
+        "پسلیاں پھیپھڑا دل کی دھڑکن نبض فشار خون شوگر ذیابیطس کینسر ورم سوجن "
+        "چوٹ زخم پٹی مرہم اینٹی بائیوٹک گولی کیپسول شربت ٹانکا ٹانکے پلستر "
+        "ایکس رے الٹرا ساؤنڈ اسٹیتھو اسکوپ تھرمامیٹر آکسیجن ماسک وارڈ "
+    ),
+    "person": (
+        "پروفیسر لیبارٹری اسسٹنٹ ریسرچ سکالر محقق مترجم ناشر مدیر صحافی فوٹو "
+        "گرافر ہدایت کار پروڈیوسر فنکار نقاش خطاط گلوکار موسیقار ڈرمر بانسری "
+        "نواز اداکارہ ماڈل رقاص بھانڈ نٹ مڈل کلاک ملاح ماہی گیر شکاری چرواہا "
+        "باغبان مالی رکشہ والا ٹیکسی ڈرائیور ڈرائیور کنڈکٹر ٹکٹ چیکر چوکیدار "
+        "گیٹ کیپر باورچی دودھ والا سبزی والا پھل والا کریانہ والا تاجر دکاندار "
+        "سوداگر بروکر ایجنٹ نمائندہ ڈاکیا ڈاک والا خط بردار قاصد سفیر وزیر مشیر "
+    ),
+    "tech": (
+        "ٹچ اسکرین اسمارٹ فون فیچر فون اینڈرائیڈ ایپ آئی او ایس اپ ڈیٹس ایموجی "
+        "ایموجیز استیکر گروپ چیٹ ویڈیو کال وائس کال کانفرنس میٹنگ لنک شیئر "
+        "ذاتی پیغام پیج ریچ کمنٹ لائک شیئر سبسکرائب چینل پلے بیک اسٹریمنگ "
+        "براڈ بینڈ فائبر ڈی ایس ایل روٹر ماڈم ایتھرنیٹ نیٹ ورک کیبل وائرلیس "
+        "پاس کی ہاٹ سپاٹ ہاٹ اسپاٹ ڈیٹا پیک ڈیٹا کارڈ سم کارڈ میموری کارڈ "
+        "ہارڈ ڈسک سالڈ اسٹیٹ ڈرائیو ایس ایس ڈی بیک اپ کلاؤڈ اسٹوریج "
+        "لاگ فائل ای میل ایڈریس سبجیکٹ ان باکس اسپام ٹوک اپلوڈ ڈاؤنلوڈ "
+        "اسکرین شاٹ ریکارڈنگ ایڈیٹر ورڈ پریس بلوگ وی لاگ پوڈکاسٹ "
+        "ایپلیکیشن اسٹور گوگل پلے اسٹور گوگل ڈرائیو "
+        "مصنوعی ذہانت چیٹ جی پی ٹی جنریٹو ماڈل ٹوکنائزیشن لینگویج ماڈل "
+        "پروگرامنگ لینگویج ازگر جاوا سی شارپ جاوا اسکرپٹ ٹائپ اسکرپٹ "
+        "ڈیٹا بیس ایس کیو ایل کوئری ٹیبل انڈیکس سرور ہوسٹنگ ڈومین نیم "
+    ),
+    "society": (
+        "بجٹ اجلاس بلدیہ بلدیاتی میونسپل کمشنر ڈپٹی کمشنر اسسٹنٹ کمشنر "
+        "تحصیلدار پٹواری گرداور تحصیلدار چوکی دار تھانیدار ایس ایچ او "
+        "مجسٹریٹ سیشن جج ہائی کورٹ سپریم کورٹ ریفرنس درخواست وکالت نامہ "
+        "اقرار نامہ حلف نامہ گواہ گواہی شہادت ضمانت ضمانتی وارنٹ گرفتاری "
+        "تلاشی چھاپہ رشوت رشوت خور بدعنوانی احتساب نیب محکمہ دفاتر "
+        "وزارت سیکرٹری ایڈیشنل سیکرٹری جوائنٹ سیکرٹری افسر شاہی نوکر شاہی "
+        "خریداری ٹھیکہ ٹینڈر بولی نیلام منڈی بھاؤ نرخ مہنگائی افراط زر "
+        "سرمایہ کاری شیئر بازار حصص منافع نقصان کاروباری شراکت داری "
+        "لیبر یونین مزدوروں حقوق انسانی حقوق بنیادی حقوق شہری حقوق ووٹر "
+        "حلقہ پولنگ اسٹیشن بیلٹ پیپر الیکشن کمیشن نتائج اعلان حلف وفاداری"
+    ),
+    "education": (
+        "نرسری کنڈر گارٹن پرائمری مڈل ہائی اسکول میٹرک انٹرمیڈیٹ بی اے "
+        "بی ایس سی ایم اے ایم ایس سی ایم فل داخلہ ٹیسٹ انٹری ٹیسٹ "
+        "داخلہ پالیسی کوٹہ اسکالرشپ وظیفہ وظائف فیسوں رعایت حاضری "
+        "غیر حاضری چھٹی کی درخواست ٹائم ٹیبل نصابی کتابیں کاپیں کاپی "
+        "پنسل پین ربڑ شارپنر جیومیٹری باکس بستہ اسکول بیگ یونیفارم "
+        "ڈسپلن جرمانہ انعام تمغہ اسناد سند یافتہ گریجویٹ پوسٹ گریجویٹ "
+        "پیپر سوال نامہ جوابی پرچہ جچ نمبروں پاس فیل امتیازی نمبر "
+        "ٹاپر پوزیشن اول دوم سوم مشق سبق یادداشت نوٹس خلاصہ مباحثہ مضمون نویسی "
+    ),
+    "abstract": (
+        "امانت دیانت خیانت بددیانتی رشوت خوری بدعنوانی خود غرضی ایثار قربانی "
+        "ہمدردی غم گساری دل جوئی دل داری بے حسی سنگ دلی نرم دلی سخت دلی "
+        "شکر گزاری ناشکری نمک حلالی نمک حرامی وفاداری بے وفائی مہربانی "
+        "بدسلوکی خوش اخلاقی بداخلاقی سلیقہ بے سلیقگی سمجھ داری ناسمجھی "
+        "بصیرت دور اندیشی غلط اندیشی خود اعتمادی اعتماد باہمی اعتماد "
+        "اتحاد اتفاق اختلاف نفاق حسد رقابت مسابقت ہم آہنگی بے چینی بے سکونی "
+        "سکون قلب اطمینان بے قراری تڑپ بے تاب تابیں قرار وارفتگی سرور طرب "
+        "اندوہ الم دکھی دکھیاری غمگین مسرت شادمانی خوش حالی تنگ حالی "
+        "دعا سلام درود فاتحہ ایصال ثواب صدقہ خیرات فدیہ کفارہ قربانی "
+        "اذان اقامت وضو غسل تیمم سجدہ رکوع قیام تشہد سلام پھیرنا جماعت "
+        "جمعہ عیدین شب قدر اعتکاف تراویح تہجد اشراق چاشت اوابین "
+    ),
+    "adjective": (
+        "اونچ نیچ گہر اتھل ہموار ناہموار ٹیڑھا سیدھا کھڑا جھکا ترچھا "
+        "گول بیضوی نوکیلا کند دھار دار بھاری پھرتیلا چست سڈول متناسب "
+        "خوشبودار بدبودار چکنا کھردرا ریشےدار ریشمی گھنا ویران آباد شاداب ہرا بھرا "
+        "خشک نم زنگ آلود چمکتی دمکتی مدھم روشن تاریک صاف شفاف گدلا "
+        "ذہین کند ذہن بیدار غافل چوکس لاپرواہ محتاط بے پروا مخلص بے غرض "
+        "خود غرض ضدی ہٹی ضد کرنے والا نرم مزاج سخت گیر کھرا کھوٹا "
+        "اصلی نقلی مصنوعی قدرتی تازہ دم سرسبز پُر سکون بے سکون پُر امید مایوس "
+        "کم قیمت زیادہ قیمت منافع بخش نقصان دہ صحت بخش مضر صحت "
+    ),
+    "time": (
+        "صبح سویرے دن چڑھے دوپہر کو ڈھلتی شام رات گئے آدھی رات پو پھٹنے "
+        "طلوع آفتاب غروب آفتاب شفق سحر بھور پہر پہروں لمحہ بھر "
+        "گزشتہ آئندہ موجودہ حالیہ سابقہ آنے والا گزرا ہوا اگلا پچھلا "
+        "روزانہ ہفتہ وار ماہانہ سالانہ سہ ماہی شش ماہی وقتی عارضی مستقل "
+        "تعطیلات چھٹیاں تہوار میلہ موسم برسات گرمیوں سردیوں بہار خزاں "
+    ),
+    "color": (
+        "سیاہ سفید سرخوں نیلگوں سبزی مائل پیلاہٹ سرخی نیلاہٹ سیاہی "
+        "رنگ برنگے کثیر رنگ یک رنگ دو رنگ سہ رنگ سنہرا تانبئی مسی "
+        "چاندی جیسا سونے جیسا موتی جیسا پھیکا گہرا رنگین بے رنگ "
+        "چوکھٹ مثلث مربع مستطیل مخروط گھنڈ دار بیضہ دائرہ نیم دائرہ "
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# 2b. SECOND-TIER DOMAIN SEEDS  (the "more / unlimited" expansion)
+# ---------------------------------------------------------------------------
+NAME_WORDS: str = (
+    "احمد محمد علی حسن حسین عمر عثمان ابوبکر خالد طارق سلمان ابراہیم اسماعیل "
+    "یوسف یعقوب موسی داؤد سلیمان زکریا یحیی ایوب یونس ہارون الیاس شعیب یاسین "
+    "بلال حمزہ زید اسامہ مصعب معاذ انس طلحہ زبیر سعد سعید عمار حذیفہ مقداد "
+    "عبداللہ عبدالرحمٰن عبدالرحیم عبدالکریم عبدالحکیم عبدالغفار عبدالجبار "
+    "عبدالستار عبدالواحد عبدالمجید عبدالحمید عبدالحئی عبدالخالق عبدالرزاق "
+    "عبداللطیف عبدالعزیز عبدالمالک عبدالباسط عبدالباری عبدالقیوم عبدالغنی "
+    "عبدالفتاح عبدالسلام عبدالناصر عبدالہادی عبدالمنان شہزاد شاہد شہباز "
+    "شہریار شمشاد شفقت شفیق شمس شمیم شوکت شہاب صابر صادق صدیق صغیر صفدر "
+    "صلاح صمد ضیاء طاہر طفیل ظفر ظہیر عامر عابد عادل عاطف عاصم عاقل عارف "
+    "عزیز عظیم عقیل عمار عمران عمیر عنایت غازی غفار غلام فاروق فارس فاتح "
+    "فاخر فرحان فرخ فرمان فرید فضل فیصل فیض قاسم قادر قربان قمر کاشف کامل "
+    "کامران کرم کبیر خرم خورشید خلیل راشد راجا رئیس رحمت رسول رشید رضا رفعت "
+    "زاہد زبیر ذیشان ذکی ساجد ساحل سجاد سعدی سلام سلیم سمیر سناء سہیل سیف "
+    "شاکر شاہین شبیر صہیب ضمیر عدنان عرفان عصمت عتیق علیم فہد فیضان قیصر "
+    "لطیف ماجد مازن مامون مبشر متین مجاہد محسن محفوظ محمود مختار مرتضی مرزا "
+    "مشتاق مصطفی مظفر معین مفتی مقصود منصور منتظر منیر مہران میثم نادر "
+    "ناصر ناظم نعمان نقوی نور نیازی ہارون ہاشم ہشام وحید وقار یاسر "
+    "زین العابدین شمس الدین قطب الدین نظام الدین نور الدین سراج الدین "
+    "عائشہ فاطمہ خدیجہ زینب رقیہ صفیہ حفصہ جویریہ سودہ میمونہ مریم آسیہ ہاجرہ "
+    "سارہ حوا امینہ ثمینہ ثناء ثریا ثوبیہ ثمر حبیبہ حمیرا حمیدہ حنا حنیفہ "
+    "خالدہ رابعہ راحت راحیلہ راشدہ رانی رحیمہ رخسانہ رشیدہ رضیہ روبینہ "
+    "ریحانہ زاہدہ زبیدہ زرقا زلیخا زمرد زہرہ سبینہ سدرہ سعدیہ سلمی سلیمہ سمیہ "
+    "سما سمانہ سمر سنا سنبل سونیا سیدہ شائستہ شازیہ شاہدہ شبانہ شبینہ شمائلہ "
+    "شہناز شہلا شیریں شیزا صائمہ صابرہ صبیحہ صدف صدیقہ صغری صنم صوبیہ طاہرہ "
+    "طوبی عابدہ عارفہ عالیہ عامرہ عتیقہ عذرا عرشی عطیہ عفت عفیفہ عقیلہ علویہ "
+    "علیزہ عنبر عظمی فرح فرحت فرزانہ فریدہ فریحہ فریال فضیلہ قندیل کنول کشور "
+    "کلثوم گلناز لائبہ لطیفہ لبنی لیلی مائرہ ماہا ماہرہ ماہنور مدیحہ مشال مشعل "
+    "مصباح معصومہ مفرح ملکہ مناہل منال منزہ منیبہ مہرونسا مہوش مہک نائلہ نادیہ "
+    "نازیہ نازنین نشا نصرت نصیرہ نگینہ نمرہ نوال نیلم نیہا ہانیہ ہبہ ہدایت "
+    "ہما ہنزہ صاحبزادی بیگم خانم نواب چوہدری ملک مرزا سید شیخ قریشی ہاشمی "
+    "عباسی رضوی زیدی جعفری اعوان راجپوت بھٹی چوہان گکھڑ جنجوعہ مغل پٹھان "
+    "لغاری مزاری گیلانی بخاری قادری چشتی سہروردی نقشبندی نجمی صدیقی فاروقی "
+)
+
+MEDICAL_WORDS: str = (
+    "بیماری مرض علامت نشانی تشخیص علاج معالجہ صحت تندرستی خوراک پرہیز ورزش "
+    "آرام نیند بے خوابی بخار کھانسی نزلہ زکام فلو انفیکشن ورم سوجن چوٹ زخم "
+    "خراش پھوڑا ناسور السر کینسر رسولی ٹیومر ٹی بی ٹائیفائیڈ ملیریا ڈینگی "
+    "ہیپاٹائٹس پولیو خسرہ چیچک خناق نمونیا دمہ الرجی شوگر "
+    "ذیابیطس بلڈ پریشر فالج دورہ مرگی جنون ڈپریشن موٹاپا دبلاپن انیمیا "
+    "تھائرائیڈ گردہ گردے پتہ جگر معدہ آنتیں پھیپھڑا پھیپھڑے شریان ورید رگ "
+    "نبض فشار آکسیجن سانس دھڑکن ٹانکا پٹی پلاسٹر مرہم ٹیکہ ویکسین گولی "
+    "کیپسول شربت قطرے پوڈر کریم جیل اینٹی بائیوٹک اینٹی سیپٹک ڈرپ سرنج "
+    "اسٹیتھو اسکوپ تھرمامیٹر ایکسرے الٹراساؤنڈ سکین آپریشن سرجری "
+    "تھیٹر وارڈ ایمرجنسی لیب ٹیسٹ رپورٹ نسخہ پرچہ ڈاکٹر سرجن نرس کمپاؤنڈر "
+    "ہسپتال کلینک ڈسپنسری شفاخانہ مریض دوا دارو طبیب حکیم "
+    "بے ہوشی انجیکشن خون خونریزی ہڈی جوڑ کہنی گھٹنا ٹخنہ کندھا ریڑھ پسلی "
+    "کھوپڑی پٹھا پٹھے کاڑھی نفسیاتی نفسیات بیمار کمزور توانا چاق چست "
+    "دبلا پتلا موٹا تازہ دم درد کش ملٹی وٹامن زنک کیلشیم آئرن وٹامن "
+    "جراثیم وائرس بیکٹیریا فنگس پرجیوی قوت مدافعت حرارت نبض کی رفتار "
+)
+
+LAW_WORDS: str = (
+    "عدالت جج وکیل مقدمہ دعوی درخواست عرضی پٹیشن اپیل فیصلہ حکم ڈگری وارنٹ "
+    "ضمانت حلف نامہ اقرار نامہ گواہ گواہی شہادت ثبوت دلیل جرح بیان "
+    "دفعہ شق ضابطہ قانون آئین سزا جرمانہ قید پھانسی رہائی بریت معافی معاہدہ "
+    "اقرار انکار تھانہ چوکی رپورٹ تفتیش تفتیشی حراست ریمانڈ مجسٹریٹ "
+    "سیشن عدالت عالیہ استغاثہ مدعی ملزم مجرم مجرمانہ شکایت الزام "
+    "تہمت جرم چوری ڈکیتی قتل زخمی گرفتار رشوت بدعنوانی دھوکہ دہی "
+    "جعل سازی فراڈ منی لانڈرنگ اسمگلنگ دہشت گردی اغوا تاوان بھتہ جبری مشقت "
+    "دستاویز رجسٹری نامزدگی انتقال وراثت وصیت طلاق نکاح خلع حق مہر "
+    "عدل انصاف ظلم زیادتی حق حقوق فرض ذمہ داری عدالتی "
+    "حلف برداری فریق عبوری مستقل وکالت نامہ مختار نامہ نمائندہ مشیر "
+    "وکیل صاحب مقدمہ بازی قانونی چارہ جوئی جرم ثابت بری سزا یافتہ "
+)
+
+MILITARY_WORDS: str = (
+    "فوج بحریہ فضائیہ رینجرز لیویز جوان سپاہی افسر کیپٹن "
+    "میجر کرنل بریگیڈیئر جرنل لیفٹیننٹ سارجنٹ حوالدار نائیک سپہ سالار کمانڈر "
+    "کمانڈ چھاؤنی کینٹ پوسٹ مورچہ خندق سرحد محاذ جنگ معرکہ حملہ "
+    "جوابی دفاع محاصرہ شکست فتح قیدی ہتھیار بندوق رائفل پستول گولی گولہ "
+    "بارود بم بمباری ٹینک توپ میزائل ڈرون ہیلی کاپٹر طیارہ آبدوز "
+    "رڈار وردی ہیلمٹ جیکٹ ٹریننگ مشق پریڈ سلامی جھنڈا نشان تمغہ شہادت شہید "
+    "غازی ریٹائرمنٹ پنشن جارحیت محافظ گشت ناکہ پہرہ چوکیدار "
+    "اسلحہ بارودی سرنگ دستی بم مشین گن شاٹ گن "
+    "فوجی دستہ بریگیڈ ڈویژن بٹالین کمپنی پلاٹون جنگی طیارہ "
+)
+
+TRANSPORT_WORDS: str = (
+    "گاڑی کار ٹیکسی بس وین ٹرک ٹرالر رکشہ سائیکل سکوٹر ٹرین ریل "
+    "انجن بوگی پٹری اسٹیشن پلیٹ فارم ٹکٹ جہاز طیارہ "
+    "ایرپورٹ ٹرمینل پائلٹ کیبن عملہ مسافر سفر سفر نامہ ٹریفک سگنل "
+    "چوک چوراہا اسٹاپ پٹرول ڈیزل پمپ ٹائر پہیہ اسٹیئرنگ بریک بیٹری "
+    "لائٹ ہارن وائپر سیٹ بیلٹ سڑک شاہراہ موٹروے پل فلائی اوور "
+    "لین بندرگاہ گودی کشتی ناؤ ڈونگا ملاح کارگو لوڈر ٹرالی "
+    "ٹرانسپورٹ ڈرائیور کنڈکٹر کلینر رفتار منزل سمت نقشہ راستہ "
+    "ایمبولینس بریگیڈ ٹینکر ڈمپر بلڈوزر ہارڈ ٹرالر "
+)
+
+RELIGION_WORDS: str = (
+    "نماز روزہ زکات حج عمرہ قربانی عید جمعہ جماعت امام مؤذن اذان اقامت وضو غسل "
+    "تیمم قبلہ مسجد منبر محراب سجدہ رکوع قیام تشہد سلام تکبیر سورہ آیت پارہ "
+    "تفسیر حدیث سنت فرض واجب نفل مستحب مکروہ حلال حرام مباح طہارت نجاست پاکی "
+    "ایمان اسلام توحید رسالت نبوت عقیدہ کلمہ شہادت جنت دوزخ قیامت آخرت حساب "
+    "میزان صراط شفاعت فرشتہ جبرائیل میکائیل شیطان جن روح قبر عذاب ثواب گناہ "
+    "توبہ استغفار دعا درود فاتحہ ایصال خیرات صدقہ عشر فطرہ اعتکاف تراویح "
+    "تہجد اشراق چاشت نوافل قضا کفارہ رمضان شعبان رجب محرم صفر ربیع "
+    "شوال ذیقعد حجاج طواف کعبہ خانہ کعبہ مدینہ منورہ روضہ مسجد نبوی "
+    "قرآن مجید وحی الہام معجزہ کرامت ولی بزرگ پیر مرید بیعت سلسلہ "
+    "عالم فاضل قاری حافظ خطیب مبلغ مدرس مفتی قاضی فتویٰ حلال و حرام "
+    "عرش کرسی لوح قلم عالم غیب تقدیر قسمت نصیب بخت روزی رزق "
+)
+
+SCIENCE_WORDS: str = (
+    "طبیعیات کیمیا حیاتیات ریاضی فلکیات جغرافیہ ارضیات نفسیات عمرانیات "
+    "معاشیات فلسفہ منطق ہندسہ الجبرا حساب تفریق جمع ضرب تقسیم تناسب فیصد "
+    "مساوات زاویہ مثلث مربع مستطیل دائرہ قطر محیط رقبہ حجم کمیت توانائی "
+    "قوت حرکت رفتار اسراع کشش روشنی آواز حرارت درجہ ایٹم سالمہ عنصر مرکب "
+    "محلول تیزاب اساس نمک گیس مائع ٹھوس پگھلنا ابلنا خلیہ جین پروٹین "
+    "وٹامن انزائم بیکٹیریا وائرس فنگس پودا جانور تنفس نظام دوران خون "
+    "عصبی ہاضمہ تولید وراثت ارتقا ماحول آلودگی سیارہ ستارہ کہکشاں "
+    "سورج چاند مشتری زحل مریخ زہرہ عطارد نیپچون یورینس سیارچہ "
+    "شہاب خلا راکٹ سیٹلائٹ مدار دوربین خردبین تجربہ مشاہدہ مفروضہ نظریہ "
+    "قانون تحقیق تجربہ گاہ لیبارٹری نمونہ پیمائش اکائی میٹر گرام لیٹر "
+    "کلوگرام سینٹی میٹر کلومیٹر ملی میٹر مائیکرو نینو پیمانہ درجہ حرارت "
+    "برقی رو وولٹ ایمپیئر مزاحمت مقناطیس برقی مقناطیس لہر تعدد طول موج "
+)
+
+ART_WORDS: str = (
+    "شاعری غزل نظم قصیدہ مثنوی رباعی قطعہ حمد نعت مرثیہ منقبت نوحہ گیت "
+    "گیت نگاری موسیقی راگ راگنی سر تال لے سروڈ ہارمونیم طبلہ ڈھول ڈھولک "
+    "بانسری سارنگی ستار گٹار پیانو آرکسٹرا گلوکار گلوکارہ موسیقار نغمہ نگار "
+    "اداکار اداکارہ ہدایت کار پروڈیوسر اسکرپٹ مکالمہ منظر نامہ ڈراما سیریل "
+    "اشتہار تقریب نمائش گیلری نقاشی مصوری خطاطی مجسمہ رنگ کاری چتر کاری "
+    "ڈیزائن انداز فن فنکار تخلیق شاہکار ناول افسانہ کہانی تنقید تبصرہ "
+    "مضمون انشائیہ سوانح خود نوشت ترجمہ تالیف تصنیف اشاعت ناشر مدیر جریدہ "
+    "طبلہ نواز سارنگی نواز ہارمونیم نواز گلوکاری نغمہ سرائی شاعری کرنا "
+    "اسٹیج پردہ سکرین کیمرہ عکس فلم بندی شوٹنگ ایڈیٹنگ ڈبنگ پوسٹر ٹریلر "
+)
+
+EMOTION_WORDS: str = (
+    "خوشی مسرت شادمانی بشاشت غم دکھ رنج الم سوگ مایوسی ناامیدی یاس "
+    "افسردگی بے چینی گھبراہٹ خوف ڈر دہشت ہیبت وحشت حیرت تعجب رشک حسد جلن "
+    "طمع لالچ حرص ہوس غصہ قہر طیش اشتعال نفرت بغض عداوت دشمنی محبت عشق "
+    "چاہت لگن شوق رغبت رجحان ہمدردی ترس رحم شفقت مہر الفت عقیدت احترام "
+    "عزت غیرت حمیت خودداری انا غرور تکبر خودپسندی انکساری عاجزی شرم حیا "
+    "ندامت پشیمانی اطمینان سکون قرار تشفی تسلی بے قراری تڑپ انتظار "
+    "بے صبری صبر تحمل برداشت ہمت جرات بزدلی دلجوئی دل داری ہمدردی "
+    "غمگینی خوش مزاجی تیز مزاجی نرم دلی سخت دلی بے حسی حساسیت جذباتی "
+    "کیفیت کیف مستی سرشاری وجدان طمانچہ افسوس افسانہ افسردہ خوش باش "
+)
+
+TOOL_WORDS: str = (
+    "ہتھوڑا کلہاڑی آری رندہ بسولا چھینی ریتی ڈرل پیچکش پلاس رنچ تار کیل "
+    "اسکرو زنجیر تالا قبضہ چابی دستہ میٹر فیتہ ترازو پیمانہ گھڑی لیول "
+    "بیلچہ کدال پھاوڑا ٹریکٹر ٹرالی بیلچہ ریک اوس پھاوڑی کدالی "
+    "سیمنٹ اینٹ بجری ریت چونا گارا پلاسٹر لوہا سٹیل سریا چھڑ جستی "
+    "تانبہ پیتل ایلومینیم لکڑی ساگون دیار چیڑ اخروٹ شیشم بانس رسی جٹ "
+    "پلاسٹک شیشہ ربڑ گلو پینٹ وارنش تارپین برش رولر اسپری "
+    "سکریو ڈرائیور نٹ بولٹ واشر گیراج ورقم مشین چکی کولہو پریس بلو "
+    "بھٹی بھٹھی فرنس بھٹی کا کام دھاتی ویلڈنگ سولڈرنگ ٹھیکہ مرمت "
+)
+
+BUSINESS_WORDS: str = (
+    "کاروبار تجارت کمپنی فرم ملازم تنخواہ اجرت منافع نقصان سرمایہ بینک "
+    "رقم پیسہ کرنسی ادھار قرض سود منڈی قیمت خریداری فروخت سودا بچت بجٹ "
+    "حساب محصول ٹیکس شہرت کامیابی ناکامی ترقی زوال منافع بخش "
+    "دکان دکاندار گاہک گاہک گاہکیں تاجر سوداگر بیوپاری ہول سیلر ریٹیلر "
+    "بل پرچی رسید واؤچر انوائس کوٹیشن ٹینڈر بولی نیلام مارکیٹنگ اشتہار "
+    "برانڈ مصنوعات سروس سہولت ڈیلر ایجنٹ ڈسٹری بیوٹر سپلائر سپلائی "
+    "اسٹاک گودام انوینٹری آرڈر ڈلیوری ترسیل پیکنگ پارسل کورئیر "
+    "شراکت داری حصہ دار شیئر بازار حصص اسٹاک ایکسچینج بروکر کمیشن "
+    "لیبر یونین مزدور کاریگر دستکاری صنعت کارخانہ فیکٹری پروڈکشن "
+    "برآمد درآمد کسٹم ڈیوٹی پورٹ گڈام لائسنس رجسٹریشن ٹریڈ مارک پیٹنٹ "
+)
+
+AGRI_WORDS: str = (
+    "کاشت زراعت کسان کھیت کھلیان فصل بویائی کٹائی آبپاشی نہر نالی "
+    "پانی کا بندھ بند ٹیوب ویل رہٹ چرخہ ہل ہل چلانا ٹریکٹر بیج بیج بونا "
+    "کھاد گوبر یوریا پوٹاش نائٹروجن کیڑے مار دوا جڑی بوٹی گھاس پھوس "
+    "گندم چاول مکئی جو باجرہ جوار دال چنا مسور ماش لوبیا تل سرسوں "
+    "کپاس گنا تمباکو چائے کافی کیلہ پپیتا آم امرود بیری انار فالسہ "
+    "آلو پیاز ٹماٹر مرچ بھنڈی بینگن کدو کھیرا تربوز خربوزہ گاجر مولی "
+    "شلجم پالک میتھی دھنیا پودینہ لہسن ادرک ہلدی زیرہ الائچی لونگ "
+    "بکری بھیڑ گائے بیل بھینس اونٹ گھوڑا خچر مرغی مرغا انڈے دودھ "
+    "چرواہا چرانا باڑ باڑھ جھاڑ جھنڈ کھاد ڈالنا ہل چلانا بونا کاٹنا "
+    "ذخیرہ انبار بوری ٹرالی ہارویسٹر تھریشر مادی مشین آٹا چکی "
+)
+
+HOUSE_EXTRA_WORDS: str = (
+    "کرسی میز صوفہ پلنگ بستر تکیہ چادر رضائی کمبل قالین پردہ شیشہ بلب "
+    "پنکھا کولر ہیٹر استری ویکیوم جھاڑو پوچا صابن شیمپو تولیہ کنگھی "
+    "آئینہ قینچی سوئی دھاگہ کپڑا رسی کیل کلہاڑی پیچکاسہ ڈبہ "
+    "تھیلا بوری ٹوکری بوتل گلاس جھاگ کچرا کوڑا دان گملہ چمنی شمع "
+    "اوون فرج گیس چولہا ٹوسٹر بلینڈر مکسچر گرائنڈر جوسر کیتلی سماور "
+    "پنکھے کی چھت والا اسٹینڈ پنکھا ایئر کنڈیشنر ہیٹر استری "
+    "واشنگ مشین ڈش واشر سائیکل پمپ واٹر پمپ سمرسیبل موٹر جنریٹر "
+    "لائٹ بلب ٹیوب لائٹ چوک ساکٹ سوئچ بورڈ ایکسٹینشن وائر "
+    "بستر خانہ میز پوش صوفہ پوش قالین صاف کرنے والا "
+)
+
+FOOD_EXTRA_WORDS: str = (
+    "کچوری سموسے پکوڑے چھولے چنے لوبیا راجما سرسوں متھرا چکی تندوری "
+    "کلچہ پراٹھا پوری بھٹورا ڈبل روٹی بسکٹ ٹافیاں مٹھائی رس گلہ گلاب جامن "
+    "برفی لڈو جلیبی پاپڑی سوہان حلوہ کھیر فرنی کسٹرڈ ملائی ربڑی پنیر "
+    "لسی چھاچھ شربت ٹھنڈائی زردہ بریانی پلاؤ کڑھی نہاری حلیم کباب کوفتہ "
+    "ٹکہ سلاد رائتہ چٹنی اچار مربہ شہد چینی گڑ کھویا مکئی "
+    "کڑاہی گوشت نہاری پائے سری پائے چمپ کباب تکہ بھونا فرائی "
+    "دال ماش کی دال چنے کی دال ساگ گوشت ساگ پالک پنیر کڑاہی پنیر "
+    "کھیرا ٹماٹر پیاز لہسن ادرک ہری مرچ لال مرچ دھنیا پودینہ "
+    "چائے کافی دودھ پتی کالی چائے سبز چائے قہوہ شربت بادام والا "
+)
+
+VERB_ROOTS_EXTRA: str = (
+    "گھسیٹ کھینچ دھکیل اچھال لپیٹ کھول بند بھر خالی سیدھ "
+    "سکیڑ پھیلا بڑھا گھٹا تول ناپ کاٹ چیر پھاڑ سلا بن "
+    "رنگ پوچھ سمجھا بتا دکھا چھپا دھو نکھار سجا سنوار "
+    "ٹوٹ پھوٹ جھک اٹھ بٹھ لٹا پلٹ موڑ مڑ گھماؤ گھوم "
+    "دوڑ بھاگ کود چھلانگ رینگ سرک سلائی پھسل پھسلا ڈگمگا "
+    "چمک دمک جھلملا کپکپا لرز تھرتھرا ہل ہلا جھول لہرا "
+    "بول بک بڑبڑ گنگنا گنگنا فسفسا سرگوشی پکار چلّا پکار "
+    "ہنس مسکرا ہنسا کھلکھلا رو سوگوار سسک بلبلا سسکی "
+    "ڈر ڈرا ڈانٹ جھڑک دھمکا للکار للکارنا للکار "
+    "مان مانگ منگوا مسترد انکار تسلیم قبول سپرد حوالے "
+    "لکھ لکھوا پڑھ پڑھوا گن گنوا سوچ سوچا سمجھ سنبھال "
+    "جیت ہار لڑ بھڑ لڑکھڑا ٹکر مار پیٹ چھیڑ چھیڑنا اکسانا "
+    "اگ اگانا اُگا اُگل نگل چب بھون پکا پکوا سینک فرائی "
+    "سیکھ سکھا یاد بھول نصیحت نصیحت کر غور توجہ "
+    "بچا بچھا بچھ پھیلا پھیلا دینا مان لے لیا ہار جیت "
+)
+
+# ---------------------------------------------------------------------------
+# 2c. SACRED NAMES  (never inflected - see SACRED_NAMES / is_sacred_derivative)
+# ---------------------------------------------------------------------------
+# أسماء الحسنى - the 99 names of Allah, in both the bare and the "ال" form that
+# Urdu religious text actually uses. Respect rule: these words are stored and
+# returned exactly as written; no plural, suffix, prefix or compound is ever
+# generated from them.
+ALLAH_NAMES: str = (
+    "اللہ رب رحمٰن رحیم ملک قدوس سلام مؤمن مہیمن عزیز جبار متکبر خالق بارئ "
+    "مصور غفار قہار وہاب رزاق فتاح علیم قابض باسط خافض رافع معز مذل سمیع "
+    "بصیر حکم عدل لطیف خبیر حلیم عظیم غفور شکور علی کبیر حفیظ مقیت حسیب "
+    "جلیل کریم رقیب مجیب واسع حکیم ودود مجید باعث شہید حق وکیل قوی متین ولی "
+    "حمید محصی مبدئ معید محیی ممیت حی قیوم واجد ماجد واحد احد صمد قادر مقتدر "
+    "مقدم مؤخر اول آخر ظاہر باطن والی متعال بر تواب منتقم عفو رؤف مالک "
+    "ذوالجلال ذوالاکرام مقسط جامع غنی مغنی مانع ضار نافع نور ہادی بدیع باقی "
+    "وارث رشید صبور "
+    "الرحمن الرحیم الملک القدوس السلام المؤمن المہیمن العزیز الجبار المتکبر "
+    "الخالق البارئ المصور الغفار القہار الوہاب الرزاق الفتاح العلیم القابض "
+    "الباسط الخافض الرافع المعز المذل السمیع البصیر الحکم العدل اللطیف الخبیر "
+    "الحلیم العظیم الغفور الشکور العلی الکبیر الحفیظ المقیت الحسیب الجلیل "
+    "الکریم الرقیب المجیب الواسع الحکیم الودود المجید الباعث الشہید الحق "
+    "الوکیل القوی المتین الولی الحمید المحصی المبدئ المعید المحیی الممیت الحی "
+    "القیوم الواجد الماجد الواحد الاحد الصمد القادر المقتدر المقدم المؤخر "
+    "الاول الآخر الظاہر الباطن الوالی المتعال البر التواب المنتقم العفو الرؤف "
+    "المقسط الجامع الغنی المغنی المانع الضار النافع النور الہادی البدیع الباقی "
+    "الوارث الرشید الصبور ذوالجلال ذوالاکرام "
+    "اسم اعظم اسماء تسبیح تحمید تکبیر تقدیس حمد ثنا ذکر ذاکر مسبح "
+)
+
+# Anbiya wa Rusul - the prophets and messengers (Qur'anic 25 plus the figures
+# named in the wider Islamic tradition).
+NABI_NAMES: str = (
+    "آدم ادریس نوح ہود صالح ابراہیم لوط اسماعیل اسحاق یعقوب یوسف ایوب شعیب "
+    "موسی ہارون ذوالکفل داؤد سلیمان الیاس الیسع یونس زکریا یحیی عیسی محمد "
+    "احمد مصطفی مجتبی مرتضی شیت خضر لقمان عزیر یوشع اشموئیل شموئیل ذوالقرنین "
+    "نبی انبیا رسول رسل رسالت پیغمبر نبوت وحی "        # canonical forms only:
+    # an inflected form must never enter the pool itself, otherwise the
+    # never-inflect guard would treat it as a name and ship it verbatim.
+    "خاتم النبیین خاتمالنبیین رحمۃ اللعالمین رحمۃللعالمین "
+)
+
+# اہل بیت - the household of the Prophet ﷺ and the family of Hazrat Ali,
+# including the twelve Imams and the family of Hazrat Fatima.
+AHL_BAYT_NAMES: str = (
+    "علی حیدر اسداللہ ابوتراب مرتضی امیرالمومنین ذوالفقار فاطمہ زہرا زہراء "
+    "بتول سیدہ حسن حسین زینب کلثوم امالبنین امکلثوم رقیہ امکلثوم سکینہ "
+    "عباس قاسم عبداللہ جعفر عقیل عون محمداکبر محمداصغر طیب طاہر مطہر "
+    "زینالعابدین سجاد باقر صادق کاظم رضا تقی جواد نقی ہادی عسکری مہدی "
+    "قائم حجت منتظر نرجس حمیرا شہربانو فضہ "
+    "عبداللہ آمنہ ابوطالب ابوطالب ابولہب حمزہ عباس جعفرطیار عقیل امہانی "
+    "صفیہ اروی حلیمہ ثویبہ شیماء زبیر "
+    "خدیجہ سودہ عائشہ حفصہ زینب امسلمہ جویریہ امحبیبہ میمونہ ماریہ قبطیہ "
+    "نجف کربلا کوفہ سامرہ"
+)
+
+# Sahaba - the companions, starting with the four rightly-guided caliphs and
+# the ten given glad tidings of paradise.
+SAHABA_NAMES: str = (
+    "ابوبکر صدیق عمر فاروق عثمان غنی ذوالنورین طلحہ زبیر عبدالرحمن سعد سعید "
+    "ابوعبیدہ ابوذر سلمان عمار بلال حذیفہ مقداد ابوہریرہ انس جابر ابنمسعود "
+    "معاذ ابی زید اسامہ خالد ولید ارقم مصعب عکرمہ نعیم ضحاک ثابت ربیعہ "
+    "صحابی صحابہ صحابیہ صحابہ کرام "
+)
+
+# Canonical (folded) form of every sacred name. Built once at import, then used
+# as the hard guard that keeps the dictionary from ever inflecting them.
+SACRED_NAMES: Set[str] = _sacred_set()
+
+# Third seed tier: supplementary banks that are merged into their section.
+EXTRA_TIER_SEEDS: Dict[str, str] = {
+    "food": FOOD_EXTRA_WORDS,
+    "household": HOUSE_EXTRA_WORDS,
+}
+
+
+# Explicit irregular / idiomatic derivations that no rule should invent.
+EXTRA_FORMS: Dict[str, Tuple[str, ...]] = {
+    "باغ": ("باغبان", "باغیچہ", "باغات", "باغوں"),
+    "کتاب": ("کتابیں", "کتابوں", "کتابچہ", "کتب"),
+    "دوست": ("دوستی", "دوستوں", "دوستوں", "دوستانہ", "دوستیاں"),
+    "گھر": ("گھروں", "گھریلو", "گھروالا", "گھروالی"),
+    "دکان": ("دکاندار", "دکانیں", "دکانوں"),
+    "ملک": ("ملکوں", "ملکی", "ملک گیر"),
+    "شہر": ("شہروں", "شہری", "شہریت"),
+    "زمین": ("زمینیں", "زمینی", "زمیندار"),
+    "دولت": ("دولت مند", "دولتیں"),
+    "کار": ("کاروبار", "کاریں", "کاروں"),
+    "ہاتھ": ("ہاتھوں", "ہاتھی", "ہتھیار"),
+    "پانی": ("پانیوں", "پانی والا", "پنیر"),
+    "دودھ": ("دودھ والا", "دودھیا"),
+    "کھانا": ("کھانے", "کھانے پینے"),
+    "پڑھنا": ("پڑھائی", "پڑھاکو"),
+    "لکھنا": ("لکھائی", "لکھاری"),
+    "بڑا": ("بڑائی", "بڑاپن"),
+    "گندا": ("گندگی", "گندائی"),
+    "ٹھنڈا": ("ٹھنڈک", "ٹھنڈی"),
+    "میٹھا": ("میٹھاس", "میٹھی"),
+    "کڑوا": ("کڑواہٹ", "کڑوی"),
+    "کھٹا": ("کھٹاس", "کھٹی"),
+    "سونا": ("سونے", "سنیار"),
+    "پھول": ("پھولوں", "پھولی", "پھول والا"),
+    "دل": ("دلی", "دلدار", "دلکش"),
+    "عقل": ("عقلمند", "عقلی"),
+    "علم": ("علمی", "عالم", "علوم"),
+    "خبر": ("خبریں", "خبروں", "بے خبر"),
+    "کام": ("کامی", "کاموں"),
+    "روز": ("روزانہ", "روزی"),
+    "ماہ": ("ماہانہ", "ماہوار"),
+    "سال": ("سالانہ", "سالگرہ", "سالوں"),
+    "ہفتہ": ("ہفتہ وار", "ہفتے"),
+    "وقت": ("وقتی", "وقتاً"),
+    "نوکری": ("نوکریاں", "نوکریوں"),
+    "کمپیوٹر": ("کمپیوٹری", "کمپیوٹرز", "کمپیوٹروں"),
+    "وائرس": ("وائرسی", "وائرسز"),
+}
+
+# Words that take the "بھر" emphasise (رات بھر -> راتبھر).
+_BHAR_HOSTS: Set[str] = {
+    "دن", "رات", "صبح", "شام", "سال", "مہینہ", "ہفتہ", "عمر", "جنم", "غم",
+    "خوشی", "جیون", "دنیا", "جہان",
+}
+
+# Words that form a real compound with والا / والی (گھر والا، دودھ والا).
+_WALA_HOSTS: Set[str] = {
+    "گھر", "دکان", "بازار", "پانی", "دودھ", "روٹی", "چائے", "کھانا", "سالن",
+    "کپڑا", "جوتا", "ٹوپی", "بچہ", "بچی", "لڑکا", "لڑکی", "کام", "مال", "دل",
+    "ہاتھ", "زمین", "مکان", "گاڑی", "سائیکل", "موبائل", "کمپیوٹر", "کتاب",
+    "دوا", "سبزی", "پھل", "پھول", "مچھلی", "گوشت", "انڈا", "چاول", "نمک",
+    "مرچ", "تیل", "چینی", "آٹا", "بس", "ٹرین", "جہاز", "کشتی", "باغ",
+    "کھیت", "فصل", "بکری", "گائے", "بھینس", "مرغی", "کتا", "بلی", "شہر",
+    "گاؤں", "محلہ", "سڑک", "پل", "پہاڑ", "دریا",
+}
+
+# Productive prefixes and the bases they really attach to in Urdu.
+_PREFIX_HOSTS: Dict[str, Set[str]] = {
+    "بے": {"کار", "نام", "خبر", "بس", "حال", "شمار", "وفا", "ادب", "ہوش", "اخلاق",
+           "ایمان", "شک", "شبہ", "جان", "حس", "چارہ", "پردہ", "رحم", "خواہش", "زور",
+           "آرام", "بھروسہ", "وقت", "مطلب", "حد", "قانون", "مثال", "نظیر", "نقصان",
+           "قصور", "گناہ", "سوچ", "سمجھ", "سہارا", "دل", "دھڑک", "خوف", "فائدہ"},
+    "نا": {"کام", "اہل", "خوش", "پسند", "قابل", "صاف", "تمام", "انصاف", "فرمان",
+           "گوارا", "جان", "ممکن", "کافی", "خدا", "شکر", "سپاہی", "چیز"},
+    "غیر": {"ضروری", "ممکن", "حاضری", "موجود", "جانبدار", "ملکی", "یقینی", "مفید",
+            "قانونی", "مستحکم", "متنازعہ", "سیاسی", "فطری", "معمولی", "انصافی"},
+    "کم": {"زور", "بخت", "عمر", "آمدنی", "ظرف", "سواد", "نصیب", "بہتر", "کم",
+           "مایہ", "ہمت", "مقدار", "شرح", "وزن", "قیمت"},
+    "خوش": {"خبر", "شکل", "مزاج", "آواز", "رائے", "قسمت", "نصیب", "اندام", "خط",
+            "خوش", "حالات", "بو", "ذائقہ", "نظم", "اسلوب"},
+    "بد": {"نام", "تمیز", "مزاج", "شکل", "صورت", "چلن", "نصیب", "قسمت", "حال",
+           "بھلا", "خو", "اطوار", "سلوکی", "عنوان", "نظمی", "انتظام"},
+    "ہم": {"شکل", "نام", "وطن", "مذہب", "زبان", "سبب", "عقل", "درد", "کلام",
+           "مشرب", "نشین", "عصر", "راز", "آغوش", "مکتب", "قوم", "جنس", "رنگ"},
+    "خود": {"مختار", "اعتماد", "غرض", "پسند", "کار", "کفایت", "دار", "سوز", "نمائی"},
+}
+
+# Human-domain sections: agentive suffixes (دار، فروش، کار ...) are idiomatic.
+HUMAN_SECTIONS: Set[str] = {
+    "person", "society", "law", "business", "agri", "medical", "education",
+    "religion", "art", "sport", "tool", "food", "place", "household", "clothing",
+}
+
+# Quality sections: abstract nominalisation (ی، پن، گی، ت) is idiomatic.
+QUALITY_SECTIONS: Set[str] = {"adjective", "abstract", "emotion", "color"}
+
+# Abstract nominalisation is idiomatic per section. Adjectives take the full
+# family (نرم -> نرمی/نرماپن، ٹھنڈا -> ٹھنڈک/ٹھنڈائی), abstracts take "ی" only
+# (محبت -> محبتی), emotions take "ی/پن", colours take "ی/ت".
+QUALITY_SUFFIXES: Dict[str, Tuple[str, ...]] = {
+    "adjective": ("ی", "پن", "گی", "ت", "ائی"),
+    "abstract": ("ی",),
+    "emotion": ("ی", "پن"),
+    "color": ("ی", "ت"),
+}
+
+# Loan / brand-heavy sections: plural + والا only. No native derivation, because
+# "مائیکروسافٹگاہ" is not a word in any language.
+LOAN_ONLY_SECTIONS: Set[str] = {"tech", "science", "transport", "military", "proper", "name"}
+
+# Curated stems that genuinely take agentive suffixes (دار / مند / کار / فروش /
+# ساز / گر / دان / بان / والا). Deriving these from a *whitelist* instead of a
+# whole section is what keeps the big builds free of junk like "ذہانتساز".
+AGENTIVE_HOSTS: Set[str] = set("""
+دکان بازار کھیت کھلیان فصل باغ پھول پھل سبزی گوشت مچھلی انڈا دودھ چائے روٹی
+کتاب قلم دوات کاغذ اخبار رسالہ چاول آٹا نمک مرچ تیل گھی چینی گڑ دال چنا
+کپڑا جوتا ٹوپی شلوار قمیض دوپٹہ زیور سونا چاندی لوہا تانبا پیتل لکڑی پتھر
+مکان گھر زمین جائداد پلاٹ سرحد سڑک پل ریل بس ٹرین جہاز کشتی گاڑی سائیکل
+موبائل کمپیوٹر انٹرنیٹ ڈیٹا کیبل بیٹری مشین انجن پمپ موٹر چراغ بلب پنکھا
+کھاد بیج پانی نہر کنواں ٹیوب ویل ہل ٹریکٹر گھاس چارہ کھاد جانور بکری گائے
+بھینس بھیڑ مرغی اونٹ گھوڑا خچر کتا بلی شہد مکھی مکھن دہی لسی پنیر مکئی
+دوا دوائیں دوا خانہ علاج صحت بیماری مرہم ٹیکہ پٹی شہد روح دماغ دل کار
+کام مزدور محنت ہنر فن فنکار فنکاری شاعری افسانہ ڈراما فلم گیت موسیقی راگ
+خبر اشتہار تشہیر صحافت اخبارات تعلیم درس کتابت تصنیف ترجمہ تحقیق سائنس
+کھیل میچ ٹیم کھلاڑی کرکٹ ہاکی ٹینس کوچ ٹرافی تمغہ اسٹیڈیم میدان
+وکالت مقدمہ عدالت قانون سزا جرمانہ تحریر دستاویز رجسٹری حلف ضمانت
+سیاست حکومت وزارت محکمہ سفارت تجارت صنعت کارخانہ فیکٹری دستکاری کاریگری
+زراعت کاشت آبپاشی گودام منڈی ہول سیل ریٹیل کاروبار بینک اکاؤنٹ ٹیکس محصول
+سفر سیاحت ہوٹل ریسٹورنٹ کیفے اسکول کالج مدرسہ یونیورسٹی ہسپتال کلینک
+لباس فرنیچر صوفہ پلنگ کرسی میز الماری گھڑی کیلنڈر تصویر پوسٹر بورڈ
+چاقو چمچ پلیٹ کٹورا گلاس بوتل ڈبہ ٹوکری تھیلا بوری رسی تار زنجیر تالا چابی
+""".split())
+
+
+# Which aspectual prefixes are idiomatic for which section. The prefix is only
+# attached when the base word is also present in the curated host list
+# (_PREFIX_HOSTS), so "بے" cannot land on "کمپیوٹر" and "کم" cannot land on "آئرن".
+PREFIX_SAFE_SECTIONS: Dict[str, Tuple[str, ...]] = {
+    "adjective": ("بے", "نا", "غیر", "کم", "خوش", "بد", "ہم", "خود"),
+    "abstract": ("بے", "نا", "غیر", "کم", "ہم", "خود"),
+    "emotion": ("بے", "نا", "کم", "خوش", "بد", "ہم"),
+    "person": ("بے", "نا", "خوش", "بد", "کم"),
+    "society": ("بے", "نا", "غیر", "کم"),
+    "law": ("بے", "نا", "غیر"),
+    "business": ("بے", "نا", "کم"),
+    "education": ("بے", "نا", "غیر"),
+    "religion": ("بے", "نا", "غیر"),
+    "art": ("بے", "نا", "خوش"),
+    "place": ("بے", "نا"),
+    "nature": ("بے", "نا", "خوش"),
+    "agri": ("بے", "نا", "کم"),
+}
+
+
+# Sections that are stored but never inflected (names, function words, numbers).
+NON_INFLECTING_SECTIONS: Set[str] = {"proper", "name", "function", "number"}
+
+# Sacred sections: stored verbatim, excluded from every derivation stage.
+SACRED_SECTIONS: Set[str] = {"allah", "nabi", "ahlbayt", "sahaba"}
+
+# Sections that take derivational expansion in --exhaustive mode (loanwords,
+# function words and numbers are excluded: expanding them only creates noise).
+EXHAUSTIVE_SECTIONS: Tuple[str, ...] = (
+    "adjective", "abstract", "emotion", "society", "person", "place", "nature",
+    "food", "body", "medical", "household", "clothing", "color", "education",
+    "religion", "science", "art", "law", "military", "business", "agri",
+    "transport", "tool",
+)
+
+# Sections that participate in the depth-based unlimited expansion. Proper
+# nouns, personal names, function words and numbers are deliberately excluded:
+# inflecting them only creates noise.
+UNLIMITED_SECTIONS: Tuple[str, ...] = (
+    "adjective", "abstract", "emotion", "society", "person", "place", "nature",
+    "food", "body", "medical", "household", "clothing", "color", "education",
+    "religion", "science", "art", "law", "military", "business", "agri",
+    "transport", "tool", "time", "sport",
+)
+
+# Ordinals / fractions that must not receive an extra "واں".
+_ORDINAL_SKIP: Set[str] = {
+    "پہلا", "دوسرا", "تیسرا", "چوتھا", "پانچواں", "چھٹا", "ساتواں", "آٹھواں",
+    "نواں", "دسواں", "آدھا", "پاؤ", "چوتھائی", "تہائی", "دوگنا", "تگنا", "چوگنا",
+    "نصف", "فیصد", "سو", "ہزار", "لاکھ", "کروڑ", "ارب", "کھرب",
+}
+
+# Words that take "والا / والی / والے" (concrete, agentive nouns).
+
+@dataclass(frozen=True)
+class Rule:
+    """Which morphology a lexicon section is allowed to generate."""
+
+    plurals: str = "none"                  # none | urdu | loan
+    suffixes: Tuple[str, ...] = ()         # productive derivational suffixes
+    prefixes: Tuple[str, ...] = ()         # بے / نا / غیر / کم ...
+    modifiers: Tuple[str, ...] = ()        # والا / سا / سی ...
+    gender_forms: bool = False             # adjective feminine + oblique
+    abstract_forms: bool = False           # -ائی / -ی / -پن nominalisation
+
+
+RULES: Dict[str, Rule] = {
+    "function": Rule(),
+    "number": Rule(suffixes=("واں",)),
+    "time": Rule(plurals="urdu", suffixes=("وار",)),
+    "nature": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "place": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا", "والی")),
+    "proper": Rule(),                      # names stay untouched
+    "allah": Rule(),                       # sacred - never inflected
+    "nabi": Rule(),                        # sacred - never inflected
+    "ahlbayt": Rule(),                     # sacred - never inflected
+    "sahaba": Rule(),                      # sacred - never inflected
+    "name": Rule(),                        # person names stay untouched
+    "person": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "body": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "medical": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "food": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "household": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "clothing": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "transport": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "tool": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "art": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "abstract": Rule(plurals="urdu", suffixes=("ی",)),
+    "emotion": Rule(plurals="urdu", suffixes=("ی",), gender_forms=True),
+    "religion": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "science": Rule(plurals="urdu", suffixes=("ی",)),
+    "society": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "law": Rule(plurals="urdu", suffixes=("ی",)),
+    "military": Rule(plurals="urdu", suffixes=("ی",)),
+    "business": Rule(plurals="urdu", suffixes=("ی",)),
+    "agri": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+    "education": Rule(plurals="urdu", suffixes=("ی",)),
+    "color": Rule(suffixes=("ی",), gender_forms=True),
+    "adjective": Rule(
+        prefixes=("بے", "نا", "غیر", "کم", "خوش", "بد", "ہم", "خود"),
+        modifiers=(),   # "سرسبز سا" is two words; fusing it made "سرسبزسا"
+        gender_forms=True,
+        abstract_forms=True,
+    ),
+    "tech": Rule(plurals="loan", suffixes=("ی",), modifiers=("والا",)),
+    "sport": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
+}
+
+# Sections where market / place compound heads (منڈی، بازار، دکان، گودام) are
+# idiomatic. "سبزی منڈی" ✅, "پتلون منڈی" ❌ - so this stays a whitelist.
+MARKET_SECTIONS: Set[str] = {
+    "food", "agri", "place", "business", "tool", "transport", "household",
+    "clothing", "art", "education", "medical", "nature",
+}
+
+# Compound heads that genuinely fuse into ONE Urdu token, per section.
+# ("چائے" + "خانہ" = چائے خانہ، "سبزی" + "منڈی" = سبزی منڈی، ...)
+# A head is a *place or shop* morpheme (خانہ، گاہ، دکان، منڈی، بازار، گودام).
+# Attaching these to whole sections produced 5,000+ junk tokens ("آلوخانہ",
+# "آنکھگاہ", "آلودگیگودام", "آرڈرمنڈی"), so each head now carries a curated
+# host list - the same design that already keeps the agentive stage clean.
+# Heads that only ever made junk (گھر، چوک، گلی) are deliberately absent.
+HEAD_HOSTS: Dict[str, Set[str]] = {
+    "خانہ": {"چائے", "دوا", "ڈاک", "کتاب", "مہمان", "قہوہ", "مطب", "آرام", "علاج",
+             "دودھ", "نماز", "عجائب", "کتب"},
+    "گاہ": {"آرام", "ورزش", "تفریح", "عبادت", "شکار", "زیارت", "قیام", "کار", "سیر",
+            "دید", "نظارہ", "خواب", "علاج", "تدریس", "مشق", "تربیت", "استقبال",
+            "نماز", "کتب", "عجائب"},
+    "دکان": {"چائے", "دوا", "نان", "جوتا", "کپڑا", "گوشت", "سبزی", "پھل", "مچھلی",
+             "دودھ", "قلم", "کتاب", "حلوہ", "مٹھائی"},
+    "منڈی": {"سبزی", "پھل", "مچھلی", "غلہ", "اناج", "آلو", "پیاز", "گوشت",
+             "پھول", "دال", "مویشی", "مرغی", "انڈا"},
+    "بازار": {"کتاب", "غلہ", "کپڑا", "پھول", "سبزی", "سونا", "مویشی", "غلام", "چائے"},
+    "گودام": {"غلہ", "اناج", "لکڑی", "سامان", "مال", "کپڑا", "تلوار"},
+    "میدان": {"کھیل", "جنگ", "پریڈ", "دوڑ", "طاقت"},
+    "اڈہ": {"بس", "ریل", "گاڑی", "جہاز"},
+    "کھیت": {"پھول", "سبزی", "گندم", "چاول", "کپاس"},
+}
+
+
+# Each agentive suffix only attaches to the stems that really take it. The blind
+# cross product (226 hosts x 10 suffixes) produced "اسٹیڈیمفروش", "آبپاشیدان",
+# "اخبارساز" ... so the pairs are curated instead of generated.
+AGENTIVE_SUFFIX_HOSTS: Dict[str, Set[str]] = {
+    "دار": {"دکان", "کارخانہ", "کتاب", "اخبار", "اخبارات", "علم", "پرچم", "زمین", "جائداد",
+            "منڈی", "بازار", "گودام", "مکان", "دفتر", "ہوٹل", "ریسٹورنٹ", "رکشہ",
+            "ٹرک", "ٹیکسی", "سائیکل", "تھانہ", "محلہ", "ہسپتال", "کلینک", "بینک"},
+    "مند": {"عقل", "دانش", "ہنر", "نصیب", "قیمت", "اثر", "درد", "دولت", "برکت",
+            "فائدہ", "ہدف", "مقصد", "ہمت", "طاقت", "زر", "رتبہ", "علم"},
+    "کار": {"خدمت", "فن", "ہنر", "نیکی", "بدی", "خود"},
+    "دان": {"گل", "چائے", "قلم", "نمک", "پیک", "شکر", "آٹا", "میوہ", "مرچ", "دودھ"},
+    "فروش": {"پھل", "سبزی", "مچھلی", "گوشت", "دودھ", "کتاب", "کپڑا", "جوتا", "دوا",
+             "پھول", "غلہ", "اناج", "اخبار", "ٹکٹ", "مصالحہ", "حلوہ", "مٹھائی",
+             "چائے", "نان", "چاول", "دال", "انڈا", "مرغی"},
+    "ساز": {"زیور", "جوتا", "بستر", "گھڑی", "بندوق", "نقشہ", "کھلونا", "فرنیچر"},
+    "گر": {"زر", "نقش", "صورت", "بت"},
+    "بان": {"باغ", "در", "پاس", "نگہ"},
+    "ناک": {"خطرہ", "درد", "شرم", "وحشت", "رنج", "الم", "ہیبت"},
+    "والا": {"پھل", "سبزی", "پھول", "دودھ", "مچھلی", "گوشت", "کتاب", "کپڑا", "جوتا",
+             "گھی", "تیل", "چاول", "دال", "انڈا", "مرغی", "اونٹ", "گھوڑا", "بس",
+             "گاڑی", "ریل", "جہاز", "سائیکل", "فلم", "ٹوپی"},
+}
+
+AGENTIVE_SUFFIXES: Tuple[str, ...] = tuple(AGENTIVE_SUFFIX_HOSTS)
+
+
+# Western loans that Urdu pluralises with the English -ز / -س ending. Applied per
+# word: a blanket "loan" rule on these sections mints junk like "گاڑیز" and "ریلس".
+LOAN_PLURAL_HOSTS: Dict[str, Tuple[str, ...]] = {
+    "اسٹیشن": ("اسٹیشنز",),
+    "کمپیوٹر": ("کمپیوٹرز",),
+    "موبائل": ("موبائلز",),
+    "ٹکٹ": ("ٹکٹس",),
+    "بورڈ": ("بورڈز",),
+    "انجن": ("انجنوں", "انجنز"),
+    "کیبل": ("کیبلز",),
+    "پرنٹر": ("پرنٹرز",),
+    "کیمرہ": ("کیمرے", "کیمرز"),
+    "پوسٹر": ("پوسٹرز",),
+    "فائل": ("فائلیں", "فائلز"),
+    "فارم": ("فارمز",),
+    "رپورٹ": ("رپورٹیں", "رپورٹس"),
+    "بینک": ("بینکس", "بینکوں"),
+    "کورس": ("کورسز",),
+    "برانڈ": ("برانڈز",),
+}
+
+
+def _agentive_ok(stem: str, suffix: str) -> bool:
+    """May the agentive *suffix* attach to *stem*? Curated pairs only."""
+    hosts = AGENTIVE_SUFFIX_HOSTS.get(suffix)
+    return bool(hosts) and stem in hosts
+
+
+def _head_allowed(head: str, word: str) -> bool:
+    """May *head* attach to *word*? Only curated host stems qualify."""
+    hosts = HEAD_HOSTS.get(head)
+    return bool(hosts) and word in hosts
+
+
+HEADS: Dict[str, Tuple[str, ...]] = {
+    "food": ("خانہ", "دان", "منڈی", "دکان", "فروش", "گھر"),
+    "household": ("خانہ", "دان", "دکان", "گھر"),
+    "place": ("منڈی", "بازار", "خانہ", "گلی", "چوک", "گھر"),
+    "tool": ("دکان", "خانہ", "ساز", "گھر"),
+    "business": ("منڈی", "بازار", "دکان", "خانہ", "گودام"),
+    "agri": ("منڈی", "کھیت", "گودام", "فروش", "گھر"),
+    "education": ("خانہ", "گاہ", "منڈی", "گھر"),
+    "medical": ("خانہ", "گاہ"),
+    "religion": ("گاہ", "خانہ", "گھر"),
+    "art": ("گاہ", "خانہ", "ساز", "گھر"),
+    "sport": ("گاہ", "میدان", "گھر"),
+    "transport": ("گاہ", "اڈہ", "گودام"),
+    "nature": ("گاہ", "باغ", "گھر"),
+    "science": ("گاہ",),
+    "society": ("خانہ",),
+    "law": ("خانہ",),
+    "person": ("خانہ", "گھر"),
+    "body": ("خانہ", "گاہ"),
+    "clothing": ("خانہ", "دکان", "گھر"),
+    "tech": ("گاہ",),
+}
+
+
+
+
+# ---------------------------------------------------------------------------
+# 3. THE FORGE   (deterministic, streaming word generator)
+# ---------------------------------------------------------------------------
+class LexiconForge:
+    """Compiles every Urdu token the engine can plausibly need.
+
+    Stages (all deterministic -> builds are byte-for-byte reproducible):
+
+        1. curated seeds   -> daily / academic / technical vocabulary
+        2. plurals         -> real Urdu plural + oblique phonology
+        3. derivations     -> attach_suffix() with orthographic guards
+        4. prefix families -> بے / نا / غیر / کم / خوش ... + root (+ suffix)
+        5. modifiers       -> والا، سا، سی، بھر، وار on the right hosts
+        6. adjective layer -> feminine/oblique + abstract nominalisation
+        7. verb layer      -> infinitive, habitual, subjunctive, perfective,
+                              future, imperative, polite and agentive forms
+        8. extra forms     -> hand-curated irregulars (EXTRA_FORMS)
+        9. exhaustive mode -> optional maximum-recall combinatorial explosion
+    """
+
+    def __init__(self, keep_diacritics: bool = False, min_len: int = 2, max_len: int = 40):
+        self.keep_diacritics = keep_diacritics
+        self.min_len = min_len
+        self.max_len = max_len
+        self._seen: Set[str] = set()
+        self.stats: Dict[str, int] = {}
+
+    # ---------------------------------------------------------------- core
+    # Hand-written banks may contain a spaced compound that the author wants
+    # fused ("چائے خانہ" -> چائےخانہ). Generated stages must never fuse: a space
+    # there means the generator glued a phrase together, which is how
+    # "اٹھاائی والا" turned into the junk token "اٹھائیوالا".
+    FUSING_BUCKETS = ("1_curated", "8_extra_forms")
+
+    @staticmethod
+    def _may_fuse(bucket: str) -> bool:
+        return bucket.startswith("2_") or bucket in LexiconForge.FUSING_BUCKETS
+
+    def _add(self, sink: List[str], raw: str, bucket: str) -> bool:
+        if not self._may_fuse(bucket) and any(ch.isspace() for ch in raw):
+            self.stats["0_skipped_phrases"] = self.stats.get("0_skipped_phrases", 0) + 1
+            return False
+        token = canonicalize(raw, self.keep_diacritics)
+        if not token or token in self._seen or not is_valid_token(token, self.min_len, self.max_len):
+            return False
+        if is_sacred_derivative(token):        # never inflect a sacred name
+            return False
+        self._seen.add(token)
+        sink.append(token)
+        self.stats[bucket] = self.stats.get(bucket, 0) + 1
+        return True
+
+    @staticmethod
+    def _split(blob: str) -> List[str]:
+        """Split a seed bank and fold every entry.
+
+        Folding *before* the guards matters: a seed typed with a presentation
+        form ("بازﺅں") would otherwise slip past the inflection checks, because
+        the guard cannot recognise "ﺅں" as the plural marker "ؤں".
+        """
+        return [fold_seed(w) for w in blob.split() if w]
+
+    def _sections(self) -> Dict[str, List[str]]:
+        """Base seeds + second-tier seeds + third-tier extras, merged per section."""
+        merged: Dict[str, List[str]] = {}
+        for name, words in self._base_sections().items():
+            tier2 = ADDITIONAL_SEEDS.get(name, "")
+            tier3 = EXTRA_TIER_SEEDS.get(name, "")
+            merged[name] = words + self._split(tier2) + self._split(tier3)
+        return merged
+
+    @staticmethod
+    def _base_sections() -> Dict[str, List[str]]:
+        split = LexiconForge._split
+        return {
+            "function": split(FUNCTION_WORDS),
+            "number": split(NUMBER_WORDS),
+            "time": split(TIME_WORDS),
+            "nature": split(NATURE_WORDS),
+            "place": split(PLACE_WORDS),
+            "proper": split(PROPER_NOUNS),
+            "name": split(NAME_WORDS),
+            "person": split(PERSON_WORDS),
+            "body": split(BODY_WORDS),
+            "medical": split(MEDICAL_WORDS),
+            "food": split(FOOD_WORDS),
+            "household": split(HOUSEHOLD_WORDS),
+            "clothing": split(CLOTHING_WORDS),
+            "transport": split(TRANSPORT_WORDS),
+            "tool": split(TOOL_WORDS),
+            "art": split(ART_WORDS),
+            "color": split(COLOR_WORDS),
+            "abstract": split(ABSTRACT_WORDS),
+            "emotion": split(EMOTION_WORDS),
+            "religion": split(RELIGION_WORDS),
+            "science": split(SCIENCE_WORDS),
+            "adjective": split(ADJECTIVE_WORDS),
+            "society": split(SOCIETY_WORDS),
+            "law": split(LAW_WORDS),
+            "military": split(MILITARY_WORDS),
+            "business": split(BUSINESS_WORDS),
+            "agri": split(AGRI_WORDS),
+            "allah": split(ALLAH_NAMES),
+            "nabi": split(NABI_NAMES),
+            "ahlbayt": split(AHL_BAYT_NAMES),
+            "sahaba": split(SAHABA_NAMES),
+            "education": split(EDUCATION_WORDS),
+            "tech": split(TECH_WORDS),
+            "sport": split(SPORT_WORDS),
+        }
+
+    # --------------------------------------------------------------- forge
+    def forge(
+        self,
+        exhaustive: bool = False,
+        unlimited: bool = False,
+        depth: int = 2,
+        recall: bool = False,
+    ) -> Tuple[List[str], List[str]]:
+        """Compile the whole lexicon. Returns ``(all_tokens, curated_roots)``.
+
+        Modes are cumulative:
+
+            default             curated seeds + gated morphology   (~11k words)
+            exhaustive=True     + compounds, verb nouns, cross-affix (~60k words)
+            unlimited=True      + depth-based combinatorics on every section
+                                (no cap; ``depth`` 1-4 controls the explosion)
+        """
+        sections = self._sections()
+        curated: List[str] = []
+        out: List[str] = []
+
+        # stage 1 - curated seeds (never inflected further)
+        for words in sections.values():
+            for word in words:
+                self._add(curated, word, "1_curated")
+        out.extend(curated)
+        self.stats["1_curated_total"] = len(curated)
+
+        # stages 2-6 - per-section morphology
+        for name, words in sections.items():
+            if name in SACRED_SECTIONS:        # sacred names are never derived
+                continue
+            self._apply_rule(name, words, out)
+
+        # stage 7 - verbs (conjugation families)
+        self._verbs(out)
+
+        # stage 8 - curated irregulars
+        before = len(out)
+        for base, forms in EXTRA_FORMS.items():
+            self._add(out, base, "8_extra_forms")
+            for form in forms:
+                self._add(out, form, "8_extra_forms")
+        self.stats["8_extra_total"] = len(out) - before
+
+        # stage 9 - compounds (سبزی منڈی، چائے خانہ، دواخانہ ...)
+        self._compounds(out, sections)
+
+        # stage 10 - verb-derived nouns (پڑھائی، لکھاوٹ، دیکھاوٹ ...)
+        self._verb_nouns(out)
+
+        # stage 10b - agentive family on curated hosts (کتاب ساز، مچھلی فروش)
+        self._agentives(out)
+
+        # stage 11 - optional combinatorial maximum-recall expansion
+        if exhaustive or unlimited:
+            expandable: List[str] = []
+            for name in EXHAUSTIVE_SECTIONS:
+                if name in SACRED_SECTIONS:        # never inflect a sacred name
+                    continue
+                expandable.extend(sections.get(name, ()))
+            self._exhaustive(out, expandable or curated, sections)
+
+        # stage 12 - UNLIMITED depth expansion (opt-in, quality-gated)
+        if unlimited:
+            self._unlimited(out, sections, curated, depth)
+
+        # stage 13 - raw maximum-recall blast (opt-in, machine-oriented)
+        if recall:
+            self._recall_blast(out, sections, curated)
+        return out, curated
+
+    # ------------------------------------------------------------- compounds
+    def _compounds(self, out: List[str], sections: Dict[str, List[str]]) -> None:
+        """Fuse noun + compound head into real single-token Urdu words."""
+        before = len(out)
+        for head in sorted(HEAD_HOSTS):
+            for word in sorted(HEAD_HOSTS[head]):
+                self._add(out, word + head, "9_compounds")
+        self.stats["9_compounds_total"] = len(out) - before
+
+    # ------------------------------------------------------------ verb nouns
+    def _verb_nouns(self, out: List[str]) -> None:
+        """Build the verbal-noun family of every verb root in one pass.
+
+        پڑھ -> پڑھائی، پڑھاوٹ   لکھ -> لکھائی، لکھاوٹ   دیکھ -> دیکھائی، دیکھاوٹ
+        """
+        before = len(out)
+        for root in self._split(VERB_NOUN_ROOTS):
+            if len(root) < 2:
+                continue
+            base = root[:-1] + "ی" if root.endswith("ے") else root
+            self._add(out, attach_suffix(base, "ائی"), "9_verb_nouns")
+            self._add(out, attach_suffix(base, "اوٹ"), "9_verb_nouns")
+            self._add(out, base + "ن", "9_verb_nouns")          # چلن، لکھن
+            self._add(out, base + "نےوالا", "9_verb_nouns")
+        self.stats["9_verb_nouns_total"] = len(out) - before
+
+    # -------------------------------------------------------------- unlimited
+    def _unlimited(
+        self,
+        out: List[str],
+        sections: Dict[str, List[str]],
+        curated: Sequence[str],
+        depth: int,
+    ) -> None:
+        """Unlimited (no-cap) expansion driven by a hard quality rule.
+
+        **XOR rule:** a generated token carries ONE derivational suffix *or* ONE
+        compound head - never a suffix stacked on a compound, and never two
+        suffixes. Everything else is gated by *section*:
+
+            HUMAN sections (society, business, food, place, person, law,
+            military, medical, education, transport, tool, art, agri, agri)
+                -> agentive heads: دار، مند، کار، دان، فروش، ساز، گر، والا
+                -> compound heads: خانہ، گاہ، منڈی، بازار، دکان، گودام، اڈہ
+            NATURE / BODY / HOUSEHOLD / CLOTHING / TECH
+                -> relational ی, compound heads, والا
+            QUALITY (adjective, abstract, emotion, color)
+                -> abstract heads: ی، پن، گی، ت  + gender agreement
+
+        ``depth`` widens the gate:
+
+            1  one suffix or one head                        (base build)
+            2  + curated prefixes, والا-family, wider heads
+            3  + second suffix on simplex derived forms      (recall tier)
+            4  + two-head compounds                          (largest clean tier)
+
+        For truly raw recall (millions of tokens, machine-oriented) use
+        ``recall=True``.
+        """
+        before = len(out)
+        agentive = AGENTIVE_SUFFIXES
+        quality = ("ی", "پن", "گی", "ت")   # default quality family
+        relational = ("ی",)
+        stack_suffixes = ("ی", "پن")
+        wala = ("والا", "والی", "والے")
+        heads_all = ("خانہ", "گاہ", "دان", "منڈی", "بازار", "ساز", "فروش", "کار", "گر", "گھر")
+        heads_wide = ("منڈی", "بازار", "دکان", "گودام", "اڈہ", "گھر")
+
+        for name, words in sections.items():
+            if name in NON_INFLECTING_SECTIONS or name in SACRED_SECTIONS:
+                continue
+            human = name in HUMAN_SECTIONS
+            quality_sec = name in QUALITY_SECTIONS
+            loan_only = name in LOAN_ONLY_SECTIONS
+            heads = tuple(h for h in HEADS.get(name, ())
+                          if any(h in HEAD_HOSTS for _ in (0,)))
+            if human:
+                suffixes = relational          # agentives come from stage 10b
+            elif quality_sec:
+                suffixes = QUALITY_SUFFIXES.get(name, ("ی",))
+            elif loan_only:
+                suffixes = relational          # کمانڈری yes، کمانڈرپن no
+                heads = ()
+            else:
+                rule = RULES.get(name)
+                # A noun section only takes what its own Rule allows - that is what
+                # kept "گردنپن" and "ہڑتالگی" out of the build.
+                suffixes = tuple(rule.suffixes) if rule else relational
+            allowed_prefixes = PREFIX_SAFE_SECTIONS.get(name, ())
+
+            for word in words:
+                if len(word) > 12 or not _derivable(word):
+                    continue
+                level1: List[str] = []
+                # XOR choice A - one derivational suffix
+                for suffix in suffixes:
+                    if suffix in AGENTIVE_SUFFIX_HOSTS and not _agentive_ok(word, suffix):
+                        continue
+                    formed = attach_suffix(word, suffix)
+                    if formed and self._add(out, formed, "A_unlimited"):
+                        level1.append(formed)
+                # XOR choice B - one compound head
+                for head in dict.fromkeys(heads):
+                    if head == word:
+                        continue
+                    if head in HEAD_HOSTS and not _head_allowed(head, word):
+                        continue
+                    if head in AGENTIVE_SUFFIX_HOSTS and not _agentive_ok(word, head):
+                        continue
+                    self._add(out, word + head, "A_unlimited")
+                if depth < 2:
+                    continue
+                if not loan_only and word in _WALA_HOSTS:   # -والا family, curated
+                    for modifier in wala:
+                        self._add(out, word + modifier, "A_unlimited")
+                    # plural + والا: کتابوں والا، دواؤں والا (very idiomatic)
+                    if not _pluralizable(word, name):
+                        continue
+                    for plural in urdu_plurals(word)[:2]:
+                        self._add(out, plural + "والا", "A_unlimited")
+                    # relational ی: بازاری، پاکستانی، موبائلی
+                    self._add(out, attach_suffix(word, "ی"), "A_unlimited")
+                    # market / place heads, only where they make sense
+                    if name in MARKET_SECTIONS:
+                        for head in heads_wide:
+                            if _head_allowed(head, word):
+                                self._add(out, word + head, "A_unlimited")
+                for prefix in allowed_prefixes:        # curated hosts only
+                    if word in _PREFIX_HOSTS.get(prefix, ()):
+                        self._add(out, prefix + word, "A_unlimited")
+                        for suffix in suffixes[:3]:
+                            self._add(out, prefix + attach_suffix(word, suffix),
+                                      "A_unlimited")
+                if depth < 3 or loan_only:
+                    continue
+                for formed in level1:                  # second suffix on native words
+                    for suffix in stack_suffixes:
+                        self._add(out, attach_suffix(formed, suffix), "A_unlimited")
+                if depth < 4:
+                    continue
+                # depth 4 previously glued two compound heads together and minted
+                # "انجینئرگھرگر" / "ریتسازفروش". Real triple compounds are rare,
+                # so the curated, host-gated head table is what stays.
+        self.stats["A_unlimited_total"] = len(out) - before
+
+    # ------------------------------------------------------------------ recall
+    def _recall_blast(
+        self,
+        out: List[str],
+        sections: Dict[str, List[str]],
+        curated: Sequence[str],
+    ) -> None:
+        """Raw maximum-recall cross product (machine-oriented, over-generates).
+
+        This is the unfiltered engine: every curated root x every prefix x every
+        suffix x every compound head. It produces **millions** of letter-legal
+        Urdu strings and exists for spell-correction / fuzzy-match corpora,
+        not for user-visible "is this a word?" checks.
+        """
+        before = len(out)
+        prefixes = ("بے", "نا", "لا", "غیر", "ہم", "خود", "نو", "کم", "خوش", "بد",
+                    "پر", "تیز", "نیک", "شاد", "سبک", "ہمیشہ")
+        suffixes = ("ی", "پن", "گی", "یت", "دار", "مند", "ناک", "انہ", "کار",
+                    "دان", "باز", "ساز", "گر", "والا", "ہار")
+        heads = ("خانہ", "گاہ", "دان", "منڈی", "بازار", "ساز", "فروش", "کار")
+        roots: List[str] = []
+        for name in UNLIMITED_SECTIONS:
+            roots.extend(sections.get(name, ()))
+        for word in roots or curated:
+            if len(word) < 3:
+                continue
+            for suffix in suffixes:
+                self._add(out, attach_suffix(word, suffix), "B_recall")
+            for prefix in prefixes:
+                self._add(out, prefix + word, "B_recall")
+                for suffix in suffixes[:8]:
+                    base = prefix + attach_suffix(word, suffix)
+                    self._add(out, base, "B_recall")
+                    for head in heads:
+                        self._add(out, base + head, "B_recall")
+            for head in heads:
+                self._add(out, word + head, "B_recall")
+        self.stats["B_recall_total"] = len(out) - before
+
+        self.stats["A_unlimited_total"] = len(out) - before
+
+    # ------------------------------------------------------- rule execution
+    def _apply_rule(self, name: str, words: Sequence[str], out: List[str]) -> None:
+        rule = RULES.get(name)
+        if rule is None:
+            return
+        before = len(out)
+        bucket = "2_%s" % name
+        is_number = (name == "number")
+        for word in words:
+            if len(word) < 2:
+                continue
+            # 1. plurals + oblique forms
+            if rule.plurals != "none" and _pluralizable(word, name):
+                for form in urdu_plurals(word, loanword=(rule.plurals == "loan")):
+                    self._add(out, form, bucket)
+            for form in LOAN_PLURAL_HOSTS.get(word, ()):      # اسٹیشنز، کمپیوٹرز
+                self._add(out, form, bucket)
+            # 2. derivational suffixes (orthography-guarded)
+            if _derivable(word):
+                for suffix in rule.suffixes:
+                    if is_number and word in _ORDINAL_SKIP:
+                        continue
+                    self._add(out, attach_suffix(word, suffix), bucket)
+            # 3. productive prefixes - only on bases that really take them
+            if _derivable(word):
+                for prefix in rule.prefixes:
+                    hosts = _PREFIX_HOSTS.get(prefix)
+                    if hosts and word in hosts:
+                        self._add(out, prefix + word, bucket)               # بےکار
+                        self._add(out, prefix + attach_suffix(word, "ی"), bucket)  # بےکاری
+            # 4. compound modifiers
+            self._modifiers(name, word, rule, out, bucket)
+            # 5. adjective agreement + nominalisation
+            if rule.gender_forms:
+                self._gender_forms(word, out, bucket)
+            if rule.abstract_forms:
+                self._abstract_forms(word, out, bucket)
+        self.stats["%s_total" % bucket] = len(out) - before
+
+    def _modifiers(self, name: str, word: str, rule: Rule,
+                   out: List[str], bucket: str) -> None:
+        """Attach ہر compound modifier the host word really accepts."""
+        for mod in rule.modifiers:
+            if mod in ("والا", "والی", "والے"):
+                if word in _WALA_HOSTS and word[-1] != "و":
+                    self._add(out, word + mod, bucket)
+            elif mod in ("سا", "سی", "سے"):
+                if word[-1] not in "اہیے" and word[-1] != mod[0]:
+                    self._add(out, word + mod, bucket)           # اچھاسا، تیزسا
+            elif len(word) >= 3:
+                self._add(out, word + mod, bucket)
+        if word in _BHAR_HOSTS:
+            self._add(out, word + "بھر", bucket)                 # راتبھر، دنبھر
+
+    # ------------------------------------------------------------ adjectives
+    def _gender_forms(self, word: str, out: List[str], bucket: str) -> None:
+        """Urdu adjectives agree in gender/number: اچھا -> اچھی، اچھے."""
+        if not _derivable(word):
+            return
+        if word.endswith("ا") and len(word) >= 3:
+            self._add(out, word[:-1] + "ی", bucket)      # feminine singular
+            self._add(out, word[:-1] + "ے", bucket)      # oblique / plural
+
+    def _abstract_forms(self, word: str, out: List[str], bucket: str) -> None:
+        """Nominalise adjectives: بڑا -> بڑائی، نرم -> نرمی، اچھا -> اچھاپن."""
+        if not _derivable(word):
+            return
+        if word.endswith("ا"):
+            self._add(out, word[:-1] + "ائی", bucket)    # بڑائی، اونچائی، گہرائی
+            self._add(out, word + "پن", bucket)          # بڑاپن، اچھاپن
+        elif word.endswith("ہ"):
+            return
+        elif word.endswith("ی"):
+            return
+        else:
+            self._add(out, word + "ی", bucket)           # نرمی، گرمی، سختی
+            self._add(out, word + "پن", bucket)          # صاف پن
+
+    # ------------------------------------------------------------- agentives
+    def _agentives(self, out: List[str]) -> None:
+        """Attach the agentive/occupational family to curated host stems only.
+
+        Produces دکاندار، مچھلی فروش، کتاب ساز، پھول والا، نمکین ...
+        Host-gating is what separates this from blind suffixing: "ذہانت" is a
+        real word but "ذہانتساز" is not, so ذہانت is simply not in the set.
+        """
+        before = len(out)
+        for suffix, hosts in AGENTIVE_SUFFIX_HOSTS.items():
+            for host in hosts:
+                if not _derivable(host):    # کیفے is an oblique, کیفےدان is not a word
+                    continue
+                self._add(out, attach_suffix(host, suffix), "9b_agentives")
+                if suffix in ("والا", "والی"):
+                    continue
+                # ی-plural of the occupation: دکانداروں، سبزیفروشوں
+                self._add(out, attach_suffix(host, suffix) + "وں", "9b_agentives")
+        self.stats["9b_agentives_total"] = len(out) - before
+
+    # ------------------------------------------------------------------ verbs
+    def _verbs(self, out: List[str]) -> None:
+        """Conjugate every verb root in all three banks (largest single stage)."""
+        before = len(out)
+        roots = (self._split(VERB_ROOTS)
+                 + self._split(VERB_ROOTS_EXTRA)
+                 + self._split(VERB_ROOTS_2))
+        seen: Set[str] = set()
+        skipped = 0
+        for raw in roots:
+            root = _clean_root(raw)
+            if root is None:
+                skipped += 1
+                continue
+            if len(root) < 2 or root in seen:
+                continue
+            seen.add(root)
+            for form in conjugate(root):
+                self._add(out, form, "7_verb_forms")
+        self.stats["7_verb_skipped"] = skipped
+        self.stats["7_verb_total"] = len(out) - before
+
+    # -------------------------------------------------------------- exhaustive
+    def _exhaustive(self, out: List[str], curated: Sequence[str],
+                    sections: "Dict[str, List[str]] | None" = None) -> None:
+        # ``curated`` is the full seed pool; sacred names are filtered out here as
+        # a second line of defence (the caller already skips their sections).
+        """Maximum-recall expansion with section gating.
+
+        * suffixes: productive and phonotactically guarded
+        * prefixes: only on sections where بے / نا / غیر / کم really attach,
+          and only on curated host stems (see ``PREFIX_SAFE_SECTIONS``)
+        """
+        before = len(out)
+        suffixes = ("ی", "پن", "گی", "دار", "مند", "ناک", "کار", "دان", "گر", "ساز")
+        safe_prefixes = ("بے", "نا", "لا", "غیر", "کم", "خوش", "بد", "ہم", "خود", "نو")
+        adjectives = set(sections.get("adjective", ())) if isinstance(sections, dict) else set()
+        for word in curated:
+            if not _derivable(word) or is_sacred_derivative(word) or word in SACRED_NAMES:
+                continue
+            for suffix in suffixes:
+                if suffix in AGENTIVE_SUFFIX_HOSTS and not _agentive_ok(word, suffix):
+                    continue
+                if suffix in ("پن", "گی", "ت", "ائی") and word not in adjectives:
+                    continue          # "گردنپن"، "ہڑتالگی" are not words
+                self._add(out, attach_suffix(word, suffix), "9_exhaustive")
+            for prefix in safe_prefixes:
+                hosts = _PREFIX_HOSTS.get(prefix)
+                if not hosts or word not in hosts:
+                    continue
+                self._add(out, prefix + word, "9_exhaustive")
+                for suffix in ("ی", "پن", "گی"):
+                    self._add(out, prefix + attach_suffix(word, suffix), "9_exhaustive")
+        self.stats["9_exhaustive_total"] = len(out) - before
+
+        self.stats["9_exhaustive_total"] = len(out) - before
+
+
+# ---------------------------------------------------------------------------
+# 4. VERB MORPHOLOGY   (root -> full Urdu conjugation family)
+# ---------------------------------------------------------------------------
+VERB_ROOTS: str = (
+    "ہو کر جا آ دیکھ سن بول کہہ پڑھ لکھ کھا پی سو جاگ اٹھ بیٹھ چل دوڑ رک لے دے "
+    "خرید بیچ پکا دھو پہن بنا باندھ کھول توڑ جوڑ ڈھونڈ پا کھو رکھ بھر پھینک "
+    "اچھال مار چھوڑ پکڑ سیکھ سکھا سمجھ جان مان مانگ بلا پکار ہنس رو مسکرا شرما ڈر "
+    "ڈانٹ سوچ بھول کھیل ناچ گا بجا سنا بتا دکھا چھپا مل ملا بچا بچھ سیک "
+    "بن مر جی لڑ جیت ہار گزار سنبھال بدل لٹا سوکھ جل پگھل جم ٹوٹ پھٹ چھیڑ پال "
+    "بدلو جھک نکل نکال لٹک لپٹ چمک دمک سنور سدھر سکڑ پھیل گھوم گھسیٹ کھینچ "
+    "کھسک سرک سہم تھم تھک گن گنوا بہا بہک اگا اُکھاڑ ڈس ڈسا چبھ نوچ کاٹ پیس "
+    "رگڑ سلا سلوا بنوا پہنچ پوچھ اتر چڑھ لہرا جھول جھاڑ پونچھ پھیر سدھار نکھار "
+    "کھٹک ٹھہر ٹھونس ٹال ٹیک ٹیپ لپک لپیٹ سنبھلا"
+)
+
+
+# Stems that genuinely form verbal nouns (پڑھائی، لکھاوٹ، سلائی، بنائی ...).
+# Only these get the -ائی/-اوٹ/-ن family; a generic verb root does NOT.
+VERB_NOUN_ROOTS: str = (
+    "پڑھ لکھ دیکھ بن سکھ سلا پکا رکھ گن تول سجا نکھار سنوار مل لگ لٹا سوکھ جل "
+    "پھٹ ٹوٹ کھسک سرک گھما پھرا چلا جلا بھر بچا اٹھا بٹھا جھکا لٹکا لپیٹ کھول "
+    "بند سیدھ سکڑ پھیل کنگھی رنگ پچا بونا کاٹا سیوا سینچ بویا دویا پسی رگڑ "
+    "کھینچ گھسیٹ تولا ناپ سانچا ڈھال نکال چھانٹ چنائی تراش"
+)
+
+# Perfective forms that the general rule cannot derive (irregular verbs).
+# Second verb-root bank: real Urdu verb stems (used by the conjugator).
+VERB_ROOTS_2: str = (
+    "گھسیٹ کھینچ دھکیل اچھال لپیٹ کھول بند بھر خالی سکیڑ پھیلا بڑھا گھٹا "
+    "تول ناپ چیر پھاڑ سلا رنگ نکھار سجا سنوار بٹھ موڑ مڑ گھما دوڑ بھاگ کود "
+    "چھلانگ رینگ سرک سلائی پھسل ڈگمگا دمک جھلملا کپکپا لرز تھرتھرا ہلا جھول "
+    "لہرا بک بڑبڑ گنگنا فسفسا پکار چلا ہنسا کھلکھلا سسک بلبلا ڈرا جھڑک دھمکا "
+    "للکار مانگ منگوا مسترد انکار تسلیم قبول سپرد لکھوا پڑھوا گنوا سوچا سنبھال "
+    "بھڑ لڑکھڑا ٹکر چھیڑ اکسانا اگانا نگل چب بھون پکوا سینک سکھا سکھلا نصیحت "
+    "بچھا دبا اٹھا بٹھا لٹا جھکا ٹیکا سلگا جلانا بجھانا ڈبونا تیرنا ڈوبنا ابھرنا "
+    "چھپانا دکھلانا سلجھانا الجھانا کھینچنا کھسکا سرکانا چمکانا دمکانا بہلانا "
+    "ہنسی کرنا یاد کرنا بھول جانا غور کرنا کام کرنا آرام کرنا"
+)
+
+IRREGULAR_PERFECTIVE: Dict[str, Tuple[str, ...]] = {
+    "کر": ("کیا", "کیے", "کیں"),
+    "جا": ("گیا", "گئے", "گئیں"),
+    "آ": ("آیا", "آئے", "آئیں"),
+    "ہو": ("ہوا", "ہوئے", "ہوئیں"),
+    "لے": ("لیا", "لیے", "لیں"),
+    "دے": ("دیا", "دیے", "دیں"),
+    "پی": ("پیا", "پیے", "پیں"),
+    "سو": ("سویا", "سوئے", "سوئیں"),
+    "ٹوٹ": ("ٹوٹا", "ٹوٹے"),
+    "چل": ("چلا", "چلے"),
+    "بن": ("بنا", "بنے"),
+    "مل": ("ملا", "ملے"),
+    "جل": ("جلا", "جلے"),
+    "مر": ("مرا", "مرے", "مؤا"),
+}
+
+
+# Some verb banks accidentally list an *infinitive* ("ابھرنا", "کرنا") or a plain
+# noun ("آرام", "یاد") as if it were a root. Left alone they mint junk like
+# "آرامنےوالا" and "انکارتا", so roots are repaired before conjugation: an
+# infinitive-looking entry gives up its "نا / نی / نے" (ابھرنا -> ابھر), and a
+# short list of noun-only entries is refused outright.
+NON_VERB_ROOTS: Set[str] = {
+    "آرام", "انکار", "توجہ", "خالی", "یاد", "ہنسی", "بند", "ٹیک", "کام", "فرائی",
+    "بھڑ", "دوست", "دشمن", "سپرد", "عرض", "بحث", "قبول", "برتاو", "لحاظ",
+    "مسترد", "منظور", "مقرر", "برقرار", "شامل", "داخل",
+}
+
+
+def _clean_root(root: str) -> "str | None":
+    """Repair one bank entry -> a real verb root, or ``None`` to refuse it."""
+    if len(root) < 2 or root in NON_VERB_ROOTS:
+        return None
+    half, odd = divmod(len(root), 2)
+    if not odd and root[:half] == root[half:]:      # بڑبڑ -> بڑبڑا (بڑبڑانا)
+        return root + "ا"
+    if root.endswith(("نا", "نی", "نے")):
+        stem = root[:-2]
+        if len(stem) < 3:
+            return None                 # "سنا" -> "س" would be catastrophic
+        return stem or None
+    return root
+
+
+def conjugate(root: str) -> List[str]:
+    """Return the productive conjugation family of an Urdu verb *root*.
+
+    ``root`` is the stem without the infinitive ``نا`` (کھا، دیکھ، کر، ڈھونڈ ...).
+    The output mixes the *fused* single-token spelling used by this engine
+    (کھاتا، دیکھیں، کرنےوالا) which is exactly what a single-space-tokenised
+    dictionary needs.
+    """
+    # ے-final roots (لے، دے) switch to their ی-base for every suffix:
+    # دی -> دینا، دیتا، دیا، دیںگے   (never "دےتے")
+    if root.endswith("ے"):
+        root = root[:-1] + "ی"
+
+    forms: List[str] = [root + "نا", root + "نی", root + "نے", root + "نےوالا",
+                        root + "نےوالی", root + "نےوالے"]
+
+    # habitual / imperfective
+    forms += [root + "تا", root + "تی", root + "تے", root + "تیں"]
+
+    last = root[-1]
+    if last == "و":                                     # ہو، سو، رو
+        subj, imper, polite = root + "ئیں", root + "ؤ", root + "ئیے"
+        fut, fut_f, fut_pl = root + "گا", root + "گی", root + "ںگے"
+    elif last in "اآ":                                  # کھا، جا، آ، بنا
+        subj, imper, polite = root + "ئیں", root + "ؤ", root + "ئیے"
+        fut, fut_f, fut_pl = root + "ئےگا", root + "ئےگی", root + "ئیںگے"
+    elif last == "ی":                                   # دی، لی، جی
+        subj, imper, polite = root + "ں", root + "و", root + "ں"
+        fut, fut_f, fut_pl = root + "ےگا", root + "ےگی", root + "ںگے"
+    else:                                               # دیکھ، کر، پڑھ
+        subj, imper, polite = root + "یں", root + "و", root + "یے"
+        fut, fut_f, fut_pl = root + "ےگا", root + "ےگی", root + "یںگے"
+
+    forms += [subj, imper, polite, fut, fut_f, fut_pl]
+
+    # perfective (irregulars first, then the regular vowel/consonant rules)
+    if root in IRREGULAR_PERFECTIVE:
+        forms += list(IRREGULAR_PERFECTIVE[root])
+    elif last in "اآ":
+        forms += [root + "یا", root + "ئے", root + "ئیں"]        # گایا، آیا، جائیں
+    elif last == "و":
+        forms += [root + "یا", root + "ئے"]                      # رویا، سوئے
+    else:
+        forms += [root + "ا", root + "ے"]                        # پڑھا، لکھے
+        if last != "ی":
+            forms.append(root + "ی")                             # دیکھی، پڑھی
+        else:
+            forms.append(root + "ں")                             # دیں، لیں
+
+    # causative + verbal nouns (skipped on open syllables: کھلانا is irregular)
+    if last not in "اآیو":
+        forms += [root + "وانا", root + "وانے"]                  # کروانا، پڑھوانا
+        forms += [root + "ائی", root + "اوٹ"]                    # پڑھائی، لکھاوٹ
+    return _dedupe(forms)
+
+
+# ---------------------------------------------------------------------------
+# 5. COMPILE + WRITE THE COMPRESSED DATABASE
+# ---------------------------------------------------------------------------
+def _report_build(stats: Dict[str, int]) -> None:
+    print("[urduofdani] lexicon compiled in %.3fs" % stats.get("0_build_seconds", 0.0))
+    for key in sorted(stats):
+        if key.startswith("0_"):
+            continue
+        print("    + %-24s %10s" % (key, f"{stats[key]:,}"))
+    print("    = %-24s %10s unique Urdu words" % ("TOTAL", f"{stats['0_total_words']:,}"))
+
+
+# Real Urdu words that the conservative conjunction guards would drop, because
+# they are built exactly like junk: an inflected-looking stem plus a head
+# ("چائے" + "خانہ", "ہفتے" + "وار"). Curated by hand, never generated - this is
+# the escape hatch that keeps the guards strict without losing real vocabulary.
+KEEP_FORMS: Set[str] = {
+    # inflected-looking stems + head ("چائے" + "خانہ", "ہفتے" + "وار")
+    "چائےخانہ", "ہفتےوار", "مہینےوار", "راتوںوار", "غمخوار", "سردار", "ریشےدار",
+    "کارگر", "کارمند", "ہنرمند", "باصلاحیت",
+    # person names take a second agentive tail
+    "چائےخانہ",
+    # place compounds whose stem is "abstract" by the guard's reckoning
+    "ڈاکخانہ", "مہمانخانہ", "ورزشگاہ", "تفریحگاہ", "عبادتگاہ", "شکارگاہ", "زیارتگاہ",
+    "قیامگاہ", "کارگاہ", "سیرگاہ", "دیدگاہ", "نظارگاہ", "غلہمنڈی", "پھلگودام",
+    "اناجگودام", "سبزیمنڈی",
+    # two-letter hosts that still take a head ("در" + "بان"), and set compounds
+    "دربان", "پاسبان", "نگہبان", "گلدان", "چائےدان", "عجائبگھر", "حیوانخانہ",
+    "گنگنانا",
+}
+
+
+def compile_lexicon(
+    max_words: int = 0,
+    keep_diacritics: bool = False,
+    min_len: int = 2,
+    max_len: int = 40,
+    exhaustive: bool = False,
+    unlimited: bool = False,
+    depth: int = 2,
+    recall: bool = False,
+    verbose: bool = True,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Compile the lexicon and return ``(sorted_words, stats)``.
+
+    ``max_words=0`` means *unlimited* - every token the forge produces is kept.
+    When a cap is given, the alphabetical list is sampled evenly so the whole
+    alphabet stays represented instead of truncating the tail.
+
+    ``unlimited=True`` switches the forge into depth-based combinatorial mode
+    (see :meth:`LexiconForge._unlimited`); ``depth`` 1-4 controls the size.
+    """
+    t0 = time.perf_counter()
+    forge = LexiconForge(keep_diacritics=keep_diacritics, min_len=min_len, max_len=max_len)
+    words, _roots = forge.forge(exhaustive=exhaustive, unlimited=unlimited,
+                                depth=depth, recall=recall)
+    words.extend(sorted(KEEP_FORMS))          # curated real words the guards drop
+    words = _dedupe(words) if not _is_sorted(words) else words
+    words.sort()
+    total = len(words)
+
+    if max_words and total > max_words:
+        step = total / float(max_words)
+        words = [words[int(i * step)] for i in range(max_words)]
+        total = len(words)
+
+    stats: Dict[str, int] = dict(forge.stats)
+    stats["0_total_words"] = total
+    stats["0_chars"] = sum(len(w) + 1 for w in words) - 1
+    stats["0_build_seconds"] = round(time.perf_counter() - t0, 4)
+    if verbose:
+        _report_build(stats)
+    return words, stats
+
+
+def _iter_text_chunks(words: Sequence[str], chunk_tokens: int = CHUNK_TOKENS) -> Iterator[str]:
+    """Yield the payload in streaming chunks -> never materialises a giant string."""
+    for start in range(0, len(words), chunk_tokens):
+        yield SEPARATOR.join(words[start:start + chunk_tokens])
+
+
+def build_urdu_database(
+    output_path: str | os.PathLike[str] = DB_FILENAME,
+    fmt: str = "plain",
+    max_words: int = 0,
+    keep_diacritics: bool = False,
+    min_len: int = 2,
+    max_len: int = 40,
+    exhaustive: bool = False,
+    unlimited: bool = False,
+    depth: int = 2,
+    recall: bool = False,
+    verbose: bool = True,
+) -> Dict[str, object]:
+    """Compile the lexicon and atomically write the gzip binary."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt not in ("plain", "compact"):
+        raise ValueError("unknown format %r (use plain or compact)" % fmt)
+
+    words, lexicon_stats = compile_lexicon(
+        max_words=max_words, keep_diacritics=keep_diacritics,
+        min_len=min_len, max_len=max_len, exhaustive=exhaustive,
+        unlimited=unlimited, depth=depth, recall=recall, verbose=verbose,
+    )
+
+    t0 = time.perf_counter()
+    raw_bytes = 0
+    # zlib with wbits=31 == raw DEFLATE inside a standard gzip container, and
+    # MTIME is 0, so identical seeds always produce a byte-identical artifact.
+    compressor = zlib.compressobj(GZIP_LEVEL, zlib.DEFLATED, GZIP_WBITS,
+                                  GZIP_MEMLEVEL, zlib.Z_DEFAULT_STRATEGY)
+    if fmt == "compact":
+        body = pack_compact(words).encode("utf-8")
+        raw_bytes = len(body)
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=".urdu_db_", suffix=".part",
+                                            dir=str(path.parent))
+        try:
+            with os.fdopen(tmp_fd, "wb") as fh:
+                fh.write(compressor.compress(body))
+                fh.write(compressor.flush())
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, path)
+            try:
+                os.chmod(path, 0o644)
+            except OSError:
+                pass
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        write_seconds = time.perf_counter() - t0
+        packed_bytes = path.stat().st_size
+        ratio = (1.0 - packed_bytes / raw_bytes) * 100.0 if raw_bytes else 0.0
+        stats: Dict[str, object] = {
+            **lexicon_stats,
+            "0_raw_bytes": raw_bytes,
+            "0_packed_bytes": packed_bytes,
+            "0_compression_percent": round(ratio, 2),
+            "0_write_seconds": round(write_seconds, 4),
+            "0_sha256": _sha256(path),
+            "0_output": str(path),
+            "0_format": "compact",
+        }
+        if verbose:
+            print(
+                "[urduofdani] wrote %s  (compact / front-coded)\n"
+                "    payload  : %s\n"
+                "    gzip     : %s  (%.1f%% smaller)\n"
+                "    io time  : %.3fs\n"
+                "    sha256   : %s" % (
+                    path.name, _human(raw_bytes), _human(packed_bytes), ratio,
+                    write_seconds, stats["0_sha256"],
+                )
+            )
+        return stats
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".urdu_db_", suffix=".part", dir=str(path.parent))
+    try:
+        with os.fdopen(tmp_fd, "wb") as fh:
+            first = True
+            for chunk in _iter_text_chunks(words):
+                if not first:
+                    chunk = SEPARATOR + chunk
+                data = chunk.encode("utf-8")
+                raw_bytes += len(data)
+                block = compressor.compress(data)
+                if block:
+                    fh.write(block)
+                first = False
+            tail = compressor.flush()
+            if tail:
+                fh.write(tail)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)              # atomic replace (Windows-safe)
+        try:
+            os.chmod(path, 0o644)               # keep the artifact world-readable
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    write_seconds = time.perf_counter() - t0
+
+    packed_bytes = path.stat().st_size
+    ratio = (1.0 - packed_bytes / raw_bytes) * 100.0 if raw_bytes else 0.0
+    stats: Dict[str, object] = {
+        **lexicon_stats,
+        "0_raw_bytes": raw_bytes,
+        "0_packed_bytes": packed_bytes,
+        "0_compression_percent": round(ratio, 2),
+        "0_write_seconds": round(write_seconds, 4),
+        "0_sha256": _sha256(path),
+        "0_output": str(path),
+        "0_format": "plain",
+    }
+    if verbose:
+        print(
+            "[urduofdani] wrote %s\n"
+            "    raw      : %s\n"
+            "    gzip     : %s  (%.1f%% smaller)\n"
+            "    io time  : %.3fs\n"
+            "    sha256   : %s" % (
+                path.name, _human(raw_bytes), _human(packed_bytes), ratio,
+                write_seconds, stats["0_sha256"],
+            )
+        )
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# COMPACT CODEC (front-coded, ~3x smaller than the plain single-space payload)
+# ---------------------------------------------------------------------------
+COMPACT_MAGIC = "URDUFC1"          # payload header: "URDUFC1 <count> <sha8>\n"
+
+
+def pack_compact(words: Sequence[str]) -> str:
+    """Front-code a *sorted* word list into newline-separated delta entries.
+
+    Every entry is a two-character base-36 shared-prefix length plus the part of
+    the word that differs from its predecessor. Sorted Urdu shares a lot of
+    prefix (کمپیوٹر / کمپیوٹروں / کمپیوٹرز …), which is exactly what DEFLATE
+    cannot exploit on its own because the shared part is spread over the file.
+
+    The header carries the word count and a checksum of the plain payload, so a
+    truncated or edited artifact fails loudly instead of loading half a
+    dictionary.
+    """
+    chunks = [COMPACT_MAGIC, " ", str(len(words)), " ",
+              hashlib.sha256(SEPARATOR.join(words).encode("utf-8")).hexdigest()[:16], "\n"]
+    prev = ""
+    for word in words:
+        n = 0
+        limit = min(len(prev), len(word))
+        while n < limit and prev[n] == word[n]:
+            n += 1
+        chunks.append("%02x" % n if n < 36 else _base36(n))
+        chunks.append(word[n:])
+        chunks.append("\n")
+        prev = word
+    return "".join(chunks)
+
+
+def _base36(value: int) -> str:
+    """Two-character base-36 (00-zz) - keeps every entry header fixed-width."""
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    return digits[(value // 36) % 36] + digits[value % 36]
+
+
+def unpack_compact(payload: str, verify_checksum: bool = False) -> List[str]:
+    """Decode a :func:`pack_compact` payload back into the word list."""
+    lines = payload.split("\n")
+    head = lines[0].split(" ")
+    count = int(head[1]) if len(head) > 1 else -1
+    checksum = head[2] if len(head) > 2 else ""
+    words: List[str] = []
+    append = words.append
+    prev = ""
+    for line in lines[1:]:
+        if not line:
+            continue
+        n = int(line[:2], 36)
+        word = prev[:n] + line[2:]
+        append(word)
+        prev = word
+    if count >= 0 and len(words) != count:
+        raise ValueError("compact payload truncated: %d of %d words" % (len(words), count))
+    if verify_checksum and checksum:
+        got = hashlib.sha256(SEPARATOR.join(words).encode("utf-8")).hexdigest()[:16]
+        if got != checksum:
+            raise ValueError("compact payload checksum mismatch")
+    return words
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _human(num: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024 or unit == "GB":
+            return "%d B" % num if unit == "B" else "%.2f %s" % (num, unit)
+        num /= 1024.0
+    return "%.2f GB" % num
+
+
+def load_urdu_database(path: str | os.PathLike[str] = DB_FILENAME,
+                       verify_checksum: bool = False) -> List[str]:
+    """Decompress the whole database and return it as a Python list of words.
+
+    Two containers are understood, and the format is sniffed from the payload
+    itself so callers never have to care which one they were given:
+
+    * plain   - one line, single-space separated (fastest: one ``split`` call)
+    * compact - front-coded with a ``URDUFC1`` header (~3x smaller on disk)
+    """
+    with gzip.open(path, "rb") as fh:
+        payload = fh.read().decode("utf-8")
+    if not payload:
+        return []
+    if payload.startswith(COMPACT_MAGIC):
+        return unpack_compact(payload, verify_checksum=verify_checksum)
+    return payload.split(SEPARATOR)
+
+
+def iter_urdu_words(path: str | os.PathLike[str] = DB_FILENAME,
+                    block_bytes: int = 1 << 20) -> Iterator[str]:
+    """Stream words with constant memory - for multi-hundred-MB dictionaries.
+
+    Uses an *incremental* UTF-8 decoder, so a multi-byte Urdu character that
+    straddles a read boundary is never dropped (the previous implementation used
+    ``errors="ignore"`` and could corrupt a token every ``block_bytes``).
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    with gzip.open(path, "rb") as fh:
+        carry = ""
+        while True:
+            block = fh.read(block_bytes)
+            if not block:
+                break
+            text = carry + decoder.decode(block)      # keeps partial chars buffered
+            parts = text.split(SEPARATOR)
+            carry = parts.pop()
+            for word in parts:
+                if word:
+                    yield word
+        carry += decoder.decode(b"", final=True)
+        for word in carry.split(SEPARATOR):
+            if word:
+                yield word
+
+
+# ---------------------------------------------------------------------------
+# 6. RUNTIME ENGINE   (drop-in for any Python app / Tkinter / Flask UI)
+# ---------------------------------------------------------------------------
+class UrduEngine:
+    """In-memory Urdu dictionary with O(1) membership and O(log n) autocomplete.
+
+    Example
+    -------
+    >>> engine = UrduEngine()                    # auto-finds urdu_database.txt.gz
+    >>> len(engine) > 10_000
+    True
+    >>> "کمپیوٹر" in engine
+    True
+    >>> engine.suggest("کم", limit=5)[0]
+    'کم'
+    """
+
+    def __init__(self, path: str | os.PathLike[str] | None = None, lazy: bool = False):
+        self.path = Path(path) if path else _locate_database()
+        self._words: List[str] = []
+        self._lookup: Set[str] = set()
+        self.load_seconds = 0.0
+        self.last_extend_skipped = 0
+        if not lazy:
+            self.load()
+
+    # -- lifecycle --------------------------------------------------------
+    def load(self) -> "UrduEngine":
+        t0 = time.perf_counter()
+        self._words = load_urdu_database(self.path)
+        self._lookup = set(self._words)
+        self.load_seconds = time.perf_counter() - t0
+        return self
+
+    def extend(self, words: Iterable[str], strict: bool = True) -> "UrduEngine":
+        """Merge your own app/domain vocabulary and re-index in one pass.
+
+        Multi-word input is **skipped** instead of being silently fused:
+        ``"میرا لفظ"`` is two words, so it is not added as ``"میرالفظ"``.
+        Pass ``strict=False`` to keep the old fuse-anything behaviour.
+        """
+        merged = set(self._lookup)
+        skipped = 0
+        for word in words:
+            if strict and len(str(word).split()) != 1:
+                skipped += 1
+                continue
+            token = canonicalize(word)
+            if is_valid_token(token):
+                merged.add(token)
+            else:
+                skipped += 1
+        self.last_extend_skipped = skipped
+        self._words = sorted(merged)
+        self._lookup = merged
+        return self
+
+    # -- queries ----------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self._words)
+
+    def __contains__(self, word: object) -> bool:
+        return isinstance(word, str) and canonicalize(word) in self._lookup
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._words)
+
+    def __getitem__(self, index: int) -> str:
+        return self._words[index]
+
+    def words(self) -> List[str]:
+        return self._words
+
+    def suggest(self, prefix: str, limit: int = 8) -> List[str]:
+        """Instant autocomplete via binary search over the sorted word list."""
+        prefix = canonicalize(prefix)
+        if not prefix:
+            return self._words[:limit]
+        idx = bisect.bisect_left(self._words, prefix)
+        out: List[str] = []
+        while idx < len(self._words) and self._words[idx].startswith(prefix):
+            out.append(self._words[idx])
+            idx += 1
+            if len(out) >= limit:
+                break
+        return out
+
+    def search(self, query: str, limit: int = 20) -> List[str]:
+        """Substring search - handy for an offline search box / spell helper."""
+        query = canonicalize(query)
+        if not query:
+            return []
+        return [w for w in self._words if query in w][:limit]
+
+    def random_word(self, seed: int | None = None) -> str:
+        return random.Random(seed).choice(self._words)
+
+    def info(self) -> Dict[str, object]:
+        return {
+            "path": str(self.path),
+            "words": len(self._words),
+            "load_seconds": round(self.load_seconds, 6),
+            "packed_bytes": self.path.stat().st_size if self.path.exists() else 0,
+        }
+
+
+def _locate_database() -> Path:
+    """Find the DB next to the script, in cwd, in ./data, or inside the bundle."""
+    here = Path(__file__).resolve().parent
+    candidates = (
+        here / DB_FILENAME,
+        Path.cwd() / DB_FILENAME,
+        here / "data" / DB_FILENAME,
+        Path(getattr(sys, "_MEIPASS", here)) / DB_FILENAME,     # PyInstaller onefile
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------------
+# 7. VERIFY + BENCHMARK
+# ---------------------------------------------------------------------------
+def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
+                    export_txt: str | os.PathLike[str] | None = None,
+                    quiet: bool = False) -> bool:
+    """Integrity check: gzip stream, single-line payload, no junk, no dupes.
+
+    Set *quiet* when calling it from a library or a test suite - the report is
+    then returned via ``True``/``False`` only, with nothing printed.
+    """
+    path = Path(path)
+    try:
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8")
+        compact = text.startswith(COMPACT_MAGIC)
+        if compact:
+            words = unpack_compact(text, verify_checksum=True)
+            text = SEPARATOR.join(words)          # every later check works on plain text
+    except (OSError, EOFError, zlib.error) as exc:
+        # A corrupt or non-gzip file is a *failed check*, never a traceback.
+        if not quiet:
+            print("[urduofdani] verifying %s" % path.name)
+            print("    [FAIL] gzip readable      %s: %s"
+                  % (type(exc).__name__, exc))
+        return False
+    if not compact:
+        words = [w for w in text.split(SEPARATOR) if w]
+    unique = set(words)
+
+    present_sacred = sum(1 for w in unique if canonicalize(w) in SACRED_NAMES)
+    checks: List[Tuple[str, bool, str]] = [
+        ("gzip readable", True, "%d bytes packed payload%s"
+         % (path.stat().st_size, " (compact)" if compact else "")),
+        ("sacred names intact", not any(is_sacred_derivative(w) for w in words),
+         "%d present, 0 inflected" % present_sacred),
+        ("no newline", "\n" not in text and "\r" not in text, "single line"),
+        ("no comma", "," not in text, "comma-free"),
+        ("no digits", not _FORBIDDEN.search(text), "digit-free"),
+        ("non-empty database", len(words) > 0, "%d tokens" % len(words)),
+        ("no duplicates", len(words) == len(unique),
+         "%d tokens / %d unique" % (len(words), len(unique))),
+        ("all tokens legal", all(is_valid_token(w) for w in words), "100% Urdu letters"),
+    ]
+    ok = all(passed for _, passed, _ in checks)
+    if not quiet:
+        print("[urduofdani] verifying %s" % path.name)
+        for name, passed, detail in checks:
+            print("    [%s] %-18s %s" % ("PASS" if passed else "FAIL", name, detail))
+
+    if export_txt:
+        Path(export_txt).write_bytes(raw)          # raw == the plain single-line text
+        if not quiet:
+            print("    [OK]   exported plain text -> %s" % export_txt)
+    return ok
+
+
+def _print_benchmark(path: Path, words: List[str], packed: int, raw_bytes: int,
+                     saved: float, best: float, avg: float, timings: List[float],
+                     peak: int, per_sec: float) -> None:
+    """Render the human-readable benchmark report (kept out of benchmark())."""
+    print("\n" + "=" * 68)
+    print(" urduofdani :: B E N C H M A R K")
+    print("=" * 68)
+    print("  database          : %s" % path.name)
+    print("  words             : %s" % f"{len(words):,}")
+    print("  packed (.gz)      : %s" % _human(packed))
+    print("  unpacked (RAM)    : %s" % _human(raw_bytes))
+    print("  compression saved : %.1f%%" % saved)
+    print("  cold load (best)  : %.3f ms" % best)
+    print("  cold load (avg)   : %.3f ms   (%d runs)" % (avg, len(timings)))
+    print("  throughput        : %s words/sec" % f"{per_sec:,.0f}")
+    print("  peak RAM (loader) : %s" % _human(peak))
+    print("  engine ready      : UrduEngine().load_seconds -> %.6f s" % (best / 1000.0))
+    print("=" * 68 + "\n")
+
+
+def benchmark(path: str | os.PathLike[str] = DB_FILENAME, repeats: int = 5,
+              quiet: bool = False) -> Dict[str, float]:
+    """Measure cold decompression + list construction in milliseconds."""
+    path = Path(path)
+    packed = path.stat().st_size
+    timings: List[float] = []
+    words: List[str] = []
+    for _ in range(max(1, repeats)):
+        t0 = time.perf_counter()
+        words = load_urdu_database(path)
+        timings.append((time.perf_counter() - t0) * 1000.0)     # -> milliseconds
+
+    # separate pass so tracemalloc overhead never pollutes the timings
+    tracemalloc.start()
+    load_urdu_database(path)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # uncompressed size in UTF-8 BYTES (Urdu letters are 2 bytes each)
+    raw_bytes = sum(len(w.encode("utf-8")) + 1 for w in words) - 1 if words else 0
+    best = min(timings)
+    avg = sum(timings) / len(timings)
+    per_sec = len(words) / (avg / 1000.0) if avg else 0.0
+    saved = (1 - packed / raw_bytes) * 100.0 if raw_bytes else 0.0
+
+    if not quiet:
+        _print_benchmark(path, words, packed, raw_bytes, saved, best, avg, timings, peak, per_sec)
+
+    return {
+        "words": float(len(words)),
+        "packed_bytes": float(packed),
+        "raw_bytes": float(raw_bytes),
+        "best_ms": best,
+        "avg_ms": avg,
+        "words_per_sec": per_sec,
+        "peak_bytes": float(peak),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI
+# ---------------------------------------------------------------------------
+def _enable_utf8_console() -> None:
+    """Windows cp1252 consoles raise UnicodeEncodeError when printing Urdu."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")   # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="build_urdu_database",
+        description="urduofdani - compile urdu_database.txt.gz "
+                    "(single-space tokenized + gzip packed).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("-o", "--output", default=DB_FILENAME, help="output .gz path")
+    p.add_argument("-m", "--max-words", type=int, default=0,
+                   help="cap the lexicon (0 = no cap: keep every generated token)")
+    p.add_argument("--min-len", type=int, default=2, help="minimum token length")
+    p.add_argument("--max-len", type=int, default=40, help="maximum token length")
+    p.add_argument("--format", choices=("plain", "compact"), default="plain",
+                   help="payload layout: plain single-line (fastest) or compact "
+                        "front-coded (~3x smaller, ~7 ms slower to load)")
+    p.add_argument("--keep-diacritics", action="store_true",
+                   help="keep harakat instead of folding them")
+    p.add_argument("--exhaustive", action="store_true",
+                   help="maximum-recall expansion: compounds, verb nouns, affix stacks")
+    p.add_argument("--unlimited", action="store_true",
+                   help="no-cap depth expansion over every section (hundreds of thousands of words)")
+    p.add_argument("--depth", type=int, default=2, choices=(1, 2, 3, 4),
+                   help="combinatorial depth for --unlimited (4 = largest)")
+    p.add_argument("--recall", action="store_true",
+                   help="raw maximum-recall cross product (millions of tokens, machine-oriented)")
+    p.add_argument("--verify", action="store_true", help="run integrity checks after build")
+    p.add_argument("--export", metavar="TXT", default=None,
+                   help="also export the plain single-line .txt")
+    p.add_argument("--benchmark", type=int, nargs="?", const=5, default=None, metavar="N",
+                   help="benchmark N decompression runs")
+    p.add_argument("--no-build", action="store_true", help="skip compilation (use existing .gz)")
+    p.add_argument("--samples", type=int, default=6, help="print N random words at the end")
+    p.add_argument("--version", action="version", version="urduofdani %s" % SCRIPT_VERSION)
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    _enable_utf8_console()
+    args = _build_parser().parse_args(argv)
+    out = Path(args.output)
+
+    if not args.no_build:
+        build_urdu_database(
+            output_path=out,
+            max_words=max(0, args.max_words),
+            keep_diacritics=args.keep_diacritics,
+            min_len=args.min_len,
+            max_len=args.max_len,
+            exhaustive=args.exhaustive or args.unlimited or args.recall,
+            unlimited=args.unlimited or args.recall,
+            depth=args.depth,
+            recall=args.recall,
+            fmt=args.format,
+        )
+    elif not out.exists():
+        print("[urduofdani] ERROR: %s not found - run once without --no-build." % out)
+        return 2
+
+    if args.verify:
+        if not verify_database(out, export_txt=args.export):
+            return 1
+    elif args.export:
+        Path(args.export).write_text(SEPARATOR.join(load_urdu_database(out)), encoding="utf-8")
+        print("[urduofdani] exported plain text -> %s" % args.export)
+
+    if args.benchmark is not None:
+        benchmark(out, repeats=args.benchmark)
+
+    if args.samples:
+        engine = UrduEngine(out)
+        print("[urduofdani] %s words indexed in %.3f ms" %
+              (f"{len(engine):,}", engine.load_seconds * 1000))
+        random.seed(0)
+        print("[urduofdani] samples: %s" % " ".join(random.sample(engine.words(), args.samples)))
+        print("[urduofdani] suggest('کم') -> %s" % " | ".join(engine.suggest("کم", 8)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
