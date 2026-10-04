@@ -6,7 +6,7 @@ Everything here is stdlib-only Python — no virtualenv gymnastics, no build sys
 ```bash
 git clone https://github.com/forest1fire/urduofdani-dictionary.git
 cd urduofdani-dictionary
-python run_tests.py                 # 58 tests, ~3 s, stdlib only
+python run_tests.py                 # 60 tests, ~3 s, stdlib only
 python urduofdani.py verify         # 8 integrity checks on the shipped artifact
 python urduofdani.py info           # words, size, RAM, load time
 ```

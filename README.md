@@ -56,7 +56,7 @@
 | 🧩 **Zero dependencies** | Pure Python stdlib: `gzip`, `zlib`, `re`, `unicodedata` — no `pip install`, ever |
 | 🪟 **Windows-first engineering** | UTF-8 console, atomic writes, PyInstaller `--onefile` aware, no app freeze |
 | 🧾 **Reproducible artifacts** | Identical seeds ⇒ identical SHA-256 (verified in CI) |
-| 🧪 **Tested** | `python run_tests.py` → 58 tests covering orthography, morphology, sacred-name safety, the build, the engine and the CLI |
+| 🧪 **Tested** | `python run_tests.py` → 60 tests covering orthography, morphology, sacred-name safety, the build, the engine and the CLI |
 | 🖥️ **One front door** | `python urduofdani.py info/build/verify/bench/search/check/suggest/export/random/test/modes` |
 | 🚀 **Unlimited mode** | `--unlimited --depth 4` = 116,184 words; `--recall` = 2,636,229 tokens |
 | 🕌 **373 sacred names, protected** | The 99 names of Allah, the prophets, Ahl al-Bayt (including Hazrat Ali's family) and the Sahaba — **never pluralised, suffixed or compounded**, in any mode |
@@ -540,6 +540,11 @@ Shared flags: `-d/--db PATH` (use a specific database) and `-F/--full` (use
 `urdu_database.full.txt.gz`). Exit codes are script-friendly: **0** success,
 **1** check failed, **2** database missing.
 
+`build` only writes the shipped `urdu_database.txt.gz` for `--mode default`;
+every other tier defaults to its own file (`urdu_database.mini.txt.gz`,
+`urdu_database.full.txt.gz`, …) unless you pass `-o`, so a casual
+`build --mode mini` can never clobber the release artifact.
+
 ```bash
 python urduofdani.py audit       # the whole protocol, six gates, one exit code
 python urduofdani.py verify
@@ -551,7 +556,7 @@ python urduofdani.py check ززززز        # -> missing (exit 1)
 ## 7c. Tests, Examples & Tools
 
 ```bash
-python run_tests.py             # 58 tests, ~3 s, no dependencies
+python run_tests.py             # 60 tests, ~3 s, no dependencies
 python run_tests.py -v          # verbose
 python run_tests.py -k sacred   # only tests whose name matches
 ```
@@ -886,7 +891,7 @@ urduofdani-dictionary/
 ├── urdu_database.txt.gz       # default database (25,320 words / 73.0 KB)
 ├── urdu_database.full.txt.gz  # unlimited build (116,184 words / 323.2 KB)
 ├── run_tests.py               # test runner (verbosity + -k pattern filters)
-├── tests/test_urduofdani.py   # 58 tests: orthography, morphology, sacred names, build, CLI
+├── tests/test_urduofdani.py   # 60 tests: orthography, morphology, sacred names, build, CLI
 ├── examples/                  # quickstart tour + Tkinter autocomplete app
 ├── tools/                     # measure_tiers.py (benchmark table) + audit_docs.py (docs audit)
 ├── CHANGELOG.md               # release history
@@ -915,7 +920,7 @@ The full plan — including the audit protocol this project is maintained with �
 * [x] **Unlimited builds** — no cap, depth-controlled expansion (`--mode full` = 116,184 words)
 * [x] **30+ domain sections** with per-section morphology rules and curated host gates
 * [x] **373 sacred names** (Allah · Anbiya · Ahl al-Bayt · Sahaba) with a never-inflect guarantee
-* [x] **Front door, tests, CI, reproducible builds** — `urduofdani.py`, 58 tests, byte-identical artifacts
+* [x] **Front door, tests, CI, reproducible builds** — `urduofdani.py`, 60 tests, byte-identical artifacts
 * [ ] Optional **suffix-index compression** (front-coding) for smaller artifacts
 * [ ] **Roman-Urdu → Urdu** transliteration hints (`kitab → کتاب`)
 * [ ] **Hunspell / SymSpell export** (`--export-dic`, `--export-frequency`)

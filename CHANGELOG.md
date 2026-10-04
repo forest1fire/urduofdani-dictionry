@@ -10,7 +10,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 * **Front door CLI** — `python urduofdani.py {info,build,verify,bench,search,check,suggest,export,random,test,modes}` with script-friendly exit codes (0 ok, 1 check failed, 2 database missing) and a single `--mode` ladder
   (`mini` 3,000 · `default` 25,320 · `exhaustive` 43,043 · `wide` 57,806 · `full` 116,184 · `recall` 2,636,229).
-* **Test suite** — `tests/test_urduofdani.py` (58 tests) plus `run_tests.py`, covering orthography folding, morphology, the sacred-name guarantee, build determinism, gzip format, multibyte stream boundaries, the engine, the CLI and the shipped artifacts.
+* **Test suite** — `tests/test_urduofdani.py` (60 tests) plus `run_tests.py`, covering orthography folding, morphology, the sacred-name guarantee, build determinism, gzip format, multibyte stream boundaries, the engine, the CLI and the shipped artifacts.
 * **Examples** — `examples/quickstart.py` (guided tour) and `examples/autocomplete_app.py` (complete Tkinter autocomplete app with a headless `--list` mode and a PyInstaller recipe).
 * **Tools** — `tools/measure_tiers.py` (regenerates the README benchmark table, `--check README.md` fails on drift) and `tools/audit_docs.py` (anchor/link/number/CLI documentation audit).
 * **CI** — `.github/workflows/ci.yml`: tests on Linux (3.9/3.11/3.13) **and Windows**, an artifact determinism job (rebuild must be byte-identical), and a docs job.
@@ -26,6 +26,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Recovered seed banks that a refactor had orphaned (`FOOD_EXTRA_WORDS`, `HOUSE_EXTRA_WORDS` → `EXTRA_TIER_SEEDS`), +261 words.
 * `attach_suffix` orthography (`دریا` + `ی` → `دریائی`) and loan-word plurals (`لنکس`).
 * Missing/unreadable database now exits **2** with `database not found: …` instead of a traceback.
+* A corrupt or non-gzip file passed to `verify` is reported as a failed check (exit 1) instead of raising `BadGzipFile`.
+* `build` only writes the shipped `urdu_database.txt.gz` for `--mode default`; other tiers get their own default file name, so a test build can never clobber the release artifact.
 * Dead code removed: `LOAN_SECTIONS`, `VERB_NOUN_SUFFIXES`, `CONCRETE_SECTIONS`; `verify_database` grew from 6 to 8 checks (non-empty database, sacred-name integrity).
 
 ### Changed

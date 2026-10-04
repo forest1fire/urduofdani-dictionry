@@ -122,9 +122,16 @@ def build_kwargs(mode: str) -> Dict[str, object]:
     return {k: v for k, v in MODES[mode].items() if k != "blurb"}
 
 
+def default_output_path(mode: str) -> str:
+    """File name a mode writes to when `-o` is not given."""
+    return DEFAULT_DB if mode == "default" else "urdu_database.%s.txt.gz" % mode
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     spec = build_kwargs(args.mode)
-    output = args.output or (FULL_DB if args.mode in ("full", "recall") else DEFAULT_DB)
+    # Only `default` writes the shipped artifact; every other tier gets its own
+    # file name so a casual `build --mode mini` can never clobber the release.
+    output = args.output or default_output_path(args.mode)
     print("urduofdani :: build  (mode=%s - %s)" % (args.mode, MODES[args.mode]["blurb"]))
     stats = core.build_urdu_database(
         output_path=HERE / output,

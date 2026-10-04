@@ -2122,9 +2122,17 @@ def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
     then returned via ``True``/``False`` only, with nothing printed.
     """
     path = Path(path)
-    with gzip.open(path, "rb") as fh:
-        raw = fh.read()
-    text = raw.decode("utf-8")
+    try:
+        with gzip.open(path, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8")
+    except (OSError, EOFError, zlib.error) as exc:
+        # A corrupt or non-gzip file is a *failed check*, never a traceback.
+        if not quiet:
+            print("[urduofdani] verifying %s" % path.name)
+            print("    [FAIL] gzip readable      %s: %s"
+                  % (type(exc).__name__, exc))
+        return False
     words = [w for w in text.split(SEPARATOR) if w]
     unique = set(words)
 

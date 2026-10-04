@@ -230,6 +230,25 @@ class TestBuild(unittest.TestCase):
             fh.write(b"")
         self.assertFalse(core.verify_database(empty, quiet=True))
 
+    def test_verify_rejects_a_non_gzip_file(self):
+        """A plain text file must fail the check, not raise BadGzipFile."""
+        plain = pathlib.Path(self.tmp.name) / "not_gzip.txt"
+        plain.write_text("کتاب", encoding="utf-8")
+        self.assertFalse(core.verify_database(plain, quiet=True))
+
+    def test_non_default_modes_never_target_the_shipped_db(self):
+        """`build --mode mini` must not overwrite the committed default artifact."""
+        proc = subprocess.run([sys.executable, str(FRONT_DOOR), "build",
+                               "--mode", "mini", "--help"],
+                              capture_output=True, text=True, cwd=str(REPO))
+        self.assertEqual(proc.returncode, 0)
+        spec = front.build_kwargs("mini")
+        output = front.default_output_path("mini")
+        self.assertEqual(output, "urdu_database.mini.txt.gz")
+        self.assertNotEqual(output, core.DB_FILENAME)
+        self.assertEqual(front.default_output_path("default"), core.DB_FILENAME)
+        self.assertTrue(spec)                      # still a real build spec
+
     def test_verify_rejects_junk_payload(self):
         junk = pathlib.Path(self.tmp.name) / "junk.gz"
         with gzip.open(junk, "wb") as fh:
