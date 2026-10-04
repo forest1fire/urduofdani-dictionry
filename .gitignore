@@ -1,0 +1,24 @@
+# urduofdani :: build noise
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# plain-text exports of the compiled database (rebuild with --export)
+/urdu_database.txt
+*.full.txt.gz
+
+# virtualenvs / packaging
+.venv/
+venv/
+env/
+dist/
+build/
+*.spec
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
