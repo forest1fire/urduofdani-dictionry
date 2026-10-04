@@ -3,9 +3,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# plain-text exports and machine-tier builds (rebuild with --export / --recall)
+# plain-text exports and non-shipped tiers (the default + full builds ARE tracked)
 /urdu_database.txt
 *.recall.txt.gz
+/urdu_database.mini.txt.gz
+/urdu_database.exhaustive.txt.gz
+/urdu_database.wide.txt.gz
 
 # virtualenvs / packaging
 .venv/
