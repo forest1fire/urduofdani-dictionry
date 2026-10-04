@@ -1,22 +1,67 @@
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     urduofdani · Modern High-Speed Urdu Text Engine
+     Repository: forest1fire/urduofdani-dictionary
+     ═══════════════════════════════════════════════════════════════════════ -->
+
 <div align="center">
+
+<img src="assets/banner.jpg" alt="urduofdani — Modern High-Speed Urdu Text Engine" width="100%">
+
+<br>
+
+<img src="assets/logo.png" alt="urduofdani logo" width="104" height="104">
 
 # urduofdani
 ### Modern High-Speed Urdu Text Engine
 
-**10,812 curated + morphologically generated Urdu tokens · packed into a 29.6 KB gzip binary · loaded into RAM in ~1.1 ms**
+**10,812 curated + morphologically generated Urdu words, packed into a 29.6 KB gzip binary — loaded and indexed in ~1 ms.**
 
-`Single-Space Tokenization` · `Gzip (.txt.gz)` · `Zero dependencies` · `Windows-first` · `Stdlib only`
+<p>
+  <a href="#-quickstart"><img src="https://img.shields.io/badge/QUICKSTART-2_minutes-14b8a6?style=for-the-badge&logo=gnometerminal&logoColor=white" alt="Quickstart"></a>
+  <a href="#-python-api"><img src="https://img.shields.io/badge/API-reference-8b5cf6?style=for-the-badge&logo=python&logoColor=white" alt="API reference"></a>
+  <a href="https://github.com/forest1fire/urduofdani-dictionary/issues"><img src="https://img.shields.io/badge/ISSUES-report_a_bug-e11d48?style=for-the-badge&logo=github&logoColor=white" alt="Report a bug"></a>
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-0ea5e9?style=for-the-badge&logo=git&logoColor=white" alt="PRs welcome"></a>
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT License">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-64748b?style=flat-square&logo=windows&logoColor=white" alt="Platforms">
+  <img src="https://img.shields.io/badge/words-10%2C812-a855f7?style=flat-square" alt="Words">
+  <img src="https://img.shields.io/badge/.gz-29.6%20KB-14b8a6?style=flat-square" alt="Database size">
+  <img src="https://img.shields.io/badge/saved-77.8%25-f59e0b?style=flat-square" alt="Compression saved">
+  <img src="https://img.shields.io/badge/load-~1%20ms-0ea5e9?style=flat-square" alt="Load time">
+  <img src="https://img.shields.io/badge/integrity-6%2F6%20PASS-22c55e?style=flat-square" alt="Integrity checks">
+</p>
+
+<sub><b>Single-Space Tokenization</b> · <b>Gzip (.txt.gz)</b> · <b>Deterministic builds</b> · <b>Windows-first</b> · <b>Stdlib only</b></sub>
 
 </div>
 
 ---
 
-## Table of Contents
+## ✨ Highlights
+
+| | |
+|---|---|
+| 🧠 **11k+ real Urdu words** | Curated across 20 domains + deterministic Urdu morphology (plurals, gender agreement, verb families) |
+| 🗜️ **30 KB instead of 134 KB** | One single line, one space separator, gzip level 9 → **77.8% smaller** (80%+ on large builds) |
+| ⚡ **~1 ms cold load** | Decompress + split + index the whole dictionary in about one frame |
+| 🎯 **O(1) lookup / O(log n) autocomplete** | `set` membership + binary-search suggestions |
+| 🔤 **Arabic → Urdu smart folding** | `كِتاب`, `كتاب`, `کتاب` all resolve to one canonical word |
+| 🧩 **Zero dependencies** | Pure Python stdlib: `gzip`, `zlib`, `re`, `unicodedata` — no `pip install`, ever |
+| 🪟 **Windows-first engineering** | UTF-8 console, atomic writes, PyInstaller `--onefile` aware, no app freeze |
+| 🧾 **Reproducible artifacts** | Identical seeds ⇒ identical SHA-256 (`74c3d5e7…`) |
+
+---
+
+## 📚 Table of Contents
 
 1. [The Problem: MB-sized word lists and Windows app lag](#1-the-problem-mb-sized-word-lists-and-windows-app-lag)
 2. [The Solution: Single-Space Tokenization + Gzip](#2-the-solution-single-space-tokenization--gzip)
 3. [Real Benchmarks](#3-real-benchmarks)
-4. [How to Use (Setup)](#4-how-to-use-setup)
+4. [Quickstart (Setup)](#4-quickstart-setup)
 5. [Integration: Load `urdu_database.txt.gz` at Runtime](#5-integration-load-urdu_databasetxtgz-at-runtime)
 6. [Python API Reference](#6-python-api-reference)
 7. [CLI Reference](#7-cli-reference)
@@ -47,6 +92,10 @@ For a Tkinter / PyQt / Flask desktop tool, that shows up as the classic symptom:
 
 `urduofdani` attacks all three problems at once.
 
+<p align="center">
+  <img src="assets/social-preview.png" alt="urduofdani architecture card" width="82%">
+</p>
+
 ### Step 1 — Single-Space Tokenization
 
 Every word in the lexicon is serialised into **one continuous line**, separated by **exactly one ASCII space**:
@@ -57,7 +106,7 @@ Every word in the lexicon is serialised into **one continuous line**, separated 
 
 * ✅ **No newlines** (no `\n`, no `\r\n`, no Windows/Linux line-ending mismatch)
 * ✅ **No commas, no digits, no punctuation** — the payload is pure Urdu letters + single spaces
-* ✅ **No duplicates** — the compiler folds Arabic/Persian look-alike codepoints (`ك` → `ک`, `ي` → `ی`, `ة` → `ہ`) *before* de-duplication, so `كتاب` and `کتاب` can never both end up in the file
+* ✅ **No duplicates** — Arabic/Persian look-alike codepoints are folded *before* de-duplication, so `كتاب` and `کتاب` can never both end up in the file
 
 Because there is exactly one delimiter, loading is a single C-level operation:
 
@@ -97,10 +146,8 @@ Measured with `python build_urdu_database.py --benchmark 10` (Python 3.11, x86-6
 
 | Build | Words | Raw payload (UTF-8) | `urdu_database.txt.gz` | Saved | Cold load (best) | Throughput | Peak RAM (loader) |
 |---|---|---|---|---|---|---|---|
-| **Default (recommended)** | **10,812** | 133.8 KB | **29.6 KB** | **77.8%** | **1.06 ms** | ~9,300,000 words/s | 1.12 MB |
+| **Default (recommended)** | **10,812** | 133.8 KB | **29.6 KB** | **77.8%** | **1.04 ms** | ~9,300,000 words/s | 1.12 MB |
 | `--exhaustive` (maximum recall) | 53,637 | 806.6 KB | 157.7 KB | 80.4% | 5.62 ms | ~7,900,000 words/s | 5.79 MB |
-
-Full build time on the same machine:
 
 | Stage | Default build | `--exhaustive` build |
 |---|---|---|
@@ -111,7 +158,7 @@ Full build time on the same machine:
 
 > **Why the ratio is "only" ~78% here:** the shipped database is deliberately small (29.6 KB). Compression ratio rises with input size — the `--exhaustive` build already crosses **80%**, and multi-MB Urdu lists (200k+ tokens) land in the **83–84%** range. Either way, a 30 KB file is 4.5× smaller than a single JPEG icon and loads in about the time one frame takes to render.
 
-## 4. How to Use (Setup)
+## 4. Quickstart (Setup)
 
 ### Requirements
 
@@ -124,8 +171,8 @@ Full build time on the same machine:
 ### Step 1 — Get the project
 
 ```bash
-git clone https://github.com/forest1fire/urduofdani-dictionry.git
-cd urduofdani-dictionry
+git clone https://github.com/forest1fire/urduofdani-dictionary.git
+cd urduofdani-dictionary
 ```
 
 ### Step 2 — Build the database (one command)
@@ -148,8 +195,8 @@ Expected output:
 [urduofdani] wrote urdu_database.txt.gz
     raw      : 133.79 KB
     gzip     : 29.64 KB  (77.8% smaller)
-    io time  : 0.030s
-    sha256   : 74c3d5e7...
+    io time  : 0.034s
+    sha256   : 74c3d5e74d0ae93c682b7aea0236399b376a459be2056ea46f17601dcfe1b224
 ```
 
 ### Step 3 — Verify the artifact (recommended)
@@ -578,11 +625,21 @@ Morphology generation (~0.03 s for the default build, ~0.17 s for `--exhaustive`
 ## 13. Repository Layout
 
 ```text
-urduofdani-dictionry/
+urduofdani-dictionary/
 ├── build_urdu_database.py     # the whole engine: compiler + runtime + CLI (stdlib only)
 ├── urdu_database.txt.gz       # the compiled database (10,812 words / 29.6 KB)
+├── assets/
+│   ├── banner.jpg             # README banner (1600x500, fast-loading)
+│   ├── banner.png             # lossless master of the banner
+│   ├── logo.png               # project mark (512x512)
+│   ├── logo.svg               # hand-authored vector version
+│   ├── social-preview.png     # GitHub social preview card (1280x640)
+│   ├── banner-bg.png          # base artwork
+│   └── build_assets.sh        # regenerates the raster assets (ImageMagick)
+├── CONTRIBUTING.md            # how to add words, style guide, format contract
 ├── README.md                  # this document
-└── LICENSE                    # MIT
+├── LICENSE                    # MIT
+└── .gitignore
 ```
 
 After `--export` / `--exhaustive` runs you may also see `urdu_database.txt` (plain single-line text) and `urdu_database.full.txt.gz` (massive variant).
@@ -599,10 +656,27 @@ After `--export` / `--exhaustive` runs you may also see `urdu_database.txt` (pla
 
 **MIT** — free for personal and commercial use. The dictionary, the compiler and the runtime are provided as-is; see [`LICENSE`](LICENSE) for the full text.
 
+---
+
 <div align="center">
+
+### ⭐ If this saved you a few MB and a few hundred milliseconds, star the repo
+
+<a href="https://github.com/forest1fire/urduofdani-dictionary">
+  <img src="https://img.shields.io/github/stars/forest1fire/urduofdani-dictionary?style=for-the-badge&logo=github&label=stars&color=facc15" alt="Stars">
+</a>
+<a href="https://github.com/forest1fire/urduofdani-dictionary/fork">
+  <img src="https://img.shields.io/badge/fork-and_build_your_own-0ea5e9?style=for-the-badge&logo=git&logoColor=white" alt="Fork">
+</a>
+
+<br><br>
+
+<img src="assets/logo.png" alt="urduofdani" width="56" height="56">
 
 **urduofdani** — *keep the dictionary on disk tiny, keep the app instantly responsive.*
 
-افضل | اگر آپ کو یہ پروجیکٹ مفید لگے تو ستارہ ضرور دیں
+<sub>Canonical name: <code>urduofdani-dictionary</code> (previously <code>urduofdani-dictionry</code>; GitHub redirects the old URL).</sub>
+
+<sub>Built with ❤️ for Urdu · 🇵🇰 Pakistan</sub>
 
 </div>
