@@ -14,7 +14,7 @@
 # urduofdani
 ### Modern High-Speed Urdu Text Engine
 
-**24,589 curated + morphologically generated Urdu words in a 70.8 KB gzip binary (~2.4 ms load) — and up to 113,576 words in the unlimited build. No cap, no dependencies, no lag.**
+**24,809 curated + morphologically generated Urdu words in a 71.7 KB gzip binary (~2.5 ms load) — including the 99 names of Allah, the prophets, Ahl al-Bayt and the Sahaba — and up to 113,793 words in the unlimited build. No cap, no dependencies, no lag.**
 
 <p>
   <a href="#-quickstart"><img src="https://img.shields.io/badge/QUICKSTART-2_minutes-14b8a6?style=for-the-badge&logo=gnometerminal&logoColor=white" alt="Quickstart"></a>
@@ -28,11 +28,12 @@
   <img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-64748b?style=flat-square&logo=windows&logoColor=white" alt="Platforms">
-  <img src="https://img.shields.io/badge/words-24%2C589-a855f7?style=flat-square" alt="Words">
-  <img src="https://img.shields.io/badge/.gz-70.8%20KB-14b8a6?style=flat-square" alt="Database size">
-  <img src="https://img.shields.io/badge/saved-79.6%25-f59e0b?style=flat-square" alt="Compression saved">
-  <img src="https://img.shields.io/badge/load-~2.4%20ms-0ea5e9?style=flat-square" alt="Load time">
-  <img src="https://img.shields.io/badge/integrity-6%2F6%20PASS-22c55e?style=flat-square" alt="Integrity checks">
+  <img src="https://img.shields.io/badge/words-24%2C809-a855f7?style=flat-square" alt="Words">
+  <img src="https://img.shields.io/badge/.gz-71.7%20KB-14b8a6?style=flat-square" alt="Database size">
+  <img src="https://img.shields.io/badge/saved-79.5%25-f59e0b?style=flat-square" alt="Compression saved">
+  <img src="https://img.shields.io/badge/load-~2.5%20ms-0ea5e9?style=flat-square" alt="Load time">
+  <img src="https://img.shields.io/badge/integrity-7%2F7%20PASS-22c55e?style=flat-square" alt="Integrity checks">
+  <img src="https://img.shields.io/badge/sacred%20names-375%20protected-10b981?style=flat-square&logo=readthedocs&logoColor=white" alt="Sacred names protected">
   <img src="https://img.shields.io/badge/unlimited-24k%E2%86%92113k%E2%86%92millions-8b5cf6?style=flat-square" alt="Unlimited mode">
 </p>
 
@@ -46,15 +47,16 @@
 
 | | |
 |---|---|
-| 🧠 **24,589 real Urdu words** | Curated across 30 domains + deterministic Urdu morphology (plurals, gender agreement, verb families, agentives, compounds) |
-| 🗜️ **71 KB instead of 347 KB** | One line, one space separator, gzip level 9 → **79.6% smaller** (85.8% on the unlimited build) |
-| ⚡ **~2.4 ms cold load** | Decompress + split + index 24,589 words in about one frame (13 ms for 113,576) |
+| 🧠 **24,809 real Urdu words** | Curated across 34 domains + deterministic Urdu morphology (plurals, gender agreement, verb families, agentives, compounds) |
+| 🗜️ **72 KB instead of 349 KB** | One line, one space separator, gzip level 9 → **79.5% smaller** (85.7% on the unlimited build) |
+| ⚡ **~2.5 ms cold load** | Decompress + split + index 24,809 words in about one frame (14 ms for 113,793) |
 | 🎯 **O(1) lookup / O(log n) autocomplete** | `set` membership + binary-search suggestions |
 | 🔤 **Arabic → Urdu smart folding** | `كِتاب`, `كتاب`, `کتاب` all resolve to one canonical word |
 | 🧩 **Zero dependencies** | Pure Python stdlib: `gzip`, `zlib`, `re`, `unicodedata` — no `pip install`, ever |
 | 🪟 **Windows-first engineering** | UTF-8 console, atomic writes, PyInstaller `--onefile` aware, no app freeze |
 | 🧾 **Reproducible artifacts** | Identical seeds ⇒ identical SHA-256 |
-| 🚀 **Unlimited mode** | `--unlimited --depth 4` = 113k words; `--recall` = 2.6 million tokens |
+| 🚀 **Unlimited mode** | `--unlimited --depth 4` = 113.7k words; `--recall` = 2.6 million tokens |
+| 🕌 **375 sacred names, protected** | The 99 names of Allah, the prophets, Ahl al-Bayt (including Hazrat Ali's family) and the Sahaba — **never pluralised, suffixed or compounded**, in any mode |
 
 ---
 
@@ -68,6 +70,7 @@
 6. [Python API Reference](#6-python-api-reference)
 7. [CLI Reference](#7-cli-reference)
 8. [Dictionary Coverage](#8-dictionary-coverage)
+8b. [Sacred Names (Protected)](#sacred-names-protected)
 9. [How the Compiler Works](#9-how-the-compiler-works)
 10. [Extending the Dictionary with Your Own Words](#10-extending-the-dictionary-with-your-own-words)
 11. [Windows & Performance Notes](#11-windows--performance-notes)
@@ -148,11 +151,11 @@ Measured with `python build_urdu_database.py --benchmark 10` (Python 3.11, x86-6
 
 | Build | Words | Raw payload (UTF-8) | Committed `.gz` | Saved | Cold load (best) | Peak RAM (loader) | Shipped in repo |
 |---|---|---|---|---|---|---|---|
-| **Default (balanced)** | **24,589** | 346.7 KB | **70.8 KB** | **79.6%** | **2.41 ms** | 2.62 MB | ✅ `urdu_database.txt.gz` |
-| `--unlimited --depth 4` | **113,576** | 2.16 MB | **315.4 KB** | **85.8%** | 13.3 ms | 13.31 MB | ✅ `urdu_database.full.txt.gz` |
-| `--exhaustive` | 42,138 | 614.1 KB | 118.1 KB | 80.7% | 7.6 ms | 7.10 MB | on demand |
-| `--unlimited --depth 2` | 56,682 | 888.6 KB | 157.7 KB | 82.1% | 9.7 ms | — | on demand |
-| `--recall` (machine tier) | **2,596,456** | 68.5 MB | 7.0 MB | 89.3% | 883 ms | 491 MB peak build | on demand |
+| **Default (balanced)** | **24,809** | 349.1 KB | **71.7 KB** | **79.5%** | **2.48 ms** | 2.64 MB | ✅ `urdu_database.txt.gz` |
+| `--unlimited --depth 4` | **113,793** | 2.17 MB | **316.5 KB** | **85.7%** | 13.9 ms | 13.33 MB | ✅ `urdu_database.full.txt.gz` |
+| `--exhaustive` | 42,358 | 615.7 KB | 118.4 KB | 80.7% | 7.7 ms | 7.12 MB | on demand |
+| `--unlimited --depth 2` | 56,901 | 890.4 KB | 158.0 KB | 82.1% | 9.8 ms | — | on demand |
+| `--recall` (machine tier) | **2,596,675** | 68.5 MB | 7.0 MB | 89.3% | 883 ms | 491 MB peak build | on demand |
 
 | Stage | Default (24.6k) | Unlimited d4 (113.6k) | Recall (2.6M) |
 |---|---|---|---|
@@ -249,11 +252,11 @@ python build_urdu_database.py --recall -o urdu_database.recall.txt.gz
 
 | Mode | Words | What it adds | Quality |
 |---|---|---|---|
-| *(default)* | 24,589 | seeds + plurals + gender + verb families + compounds + curated agentives | ✅ hand-verified vocabulary |
-| `--exhaustive` | 42,138 | section-gated affix families, prefix hosts | ✅ high |
+| *(default)* | 24,809 | seeds + plurals + gender + verb families + compounds + curated agentives + 375 sacred names | ✅ hand-verified vocabulary |
+| `--exhaustive` | 42,358 | section-gated affix families, prefix hosts | ✅ high |
 | `--unlimited --depth 1-2` | 47k-57k | relational `-ی`, `والا` family, plural+`والا`, market heads | ✅ high |
 | `--unlimited --depth 3-4` | 58k-114k | second suffix layer, two-head compounds | ⚠️ recall tier |
-| `--recall` | 2,596,456 | full prefix × root × suffix × head cross product | ⚠️ machine only |
+| `--recall` | 2,596,675 | full prefix × root × suffix × head cross product | ⚠️ machine only |
 
 > `--unlimited` never caps the lexicon (`--max-words 0`), and `--depth` controls how
 > far the combinatorial ladder goes. Every emitted token is still **letter-legal
@@ -486,7 +489,7 @@ python build_urdu_database.py --max-words 3000 -o small.txt.gz # light build for
 
 ## 8. Dictionary Coverage
 
-**30 domain sections** · 5,845 curated seeds · 260 verb roots
+**34 domain sections** · 6,222 curated seeds · 260 verb roots · 375 protected sacred names
 
 
 | Section | Examples | Morphology applied |
@@ -522,6 +525,10 @@ python build_urdu_database.py --max-words 3000 -o small.txt.gz # light build for
 | `transport` | بوگی، پٹری، موٹروے، گودام، ٹینکر | plurals, `-ی` |
 | `tool` | رندہ، بسولا، سریا، ویلڈنگ، ٹھیکہ | plurals, `-ی`, `والا`, shop heads |
 | agentives | کتاب ساز، مچھلی فروش، دکان دار، پھول والا | 226 curated host stems × 10 suffixes |
+| `allah` 🕌 | اللہ، رحمٰن، رحیم، ملک، قدوس، غفور، ودود، ذوالجلال | **none** (sacred - never inflected) |
+| `nabi` 🕌 | آدم، نوح، ابراہیم، موسی، داؤد، عیسی، محمد، مصطفی | **none** (sacred - never inflected) |
+| `ahlbayt` 🕌 | علی، فاطمہ، حسن، حسین، زینب، عباس، مہدی، خدیجہ | **none** (sacred - never inflected) |
+| `sahaba` 🕌 | ابوبکر، عمر، عثمان، سلمان، بلال، ابوہریرہ | **none** (sacred - never inflected) |
 | verbs | کرنا، دیکھنا، پڑھنا، ڈھونڈنا … | infinitive, habitual, subjunctive, perfective, future, imperative, polite, causative, verbal nouns |
 | curated irregulars | باغبان، دکاندار، گندگی، ٹھنڈک، کتابچہ، میٹھاس | hand-written (no rule should invent these) |
 
@@ -530,6 +537,73 @@ python build_urdu_database.py --max-words 3000 -o small.txt.gz # light build for
 * **Default (balanced)** — every rule is gated by real Urdu phonology and by hand-written host sets: `بے` only attaches to bases that truly take it (`بےکار`, `بےنام`, `بےوفا`), agentive suffixes (`دار`, `فروش`, `ساز`) only to the 226 curated host stems, market heads (`منڈی`, `بازار`, `گودام`) only to the 12 sections where they are idiomatic. Result: **24,589** clean tokens.
 * **`--unlimited`** — no cap. `--depth` widens the ladder from safe derivation (`depth 1-2`) to recall-tier stacking (`depth 3-4`), reaching **113,576** tokens while staying letter-legal.
 * **`--recall`** — the unfiltered cross product: **2,596,456** machine-oriented tokens for spell-correction and fuzzy search.
+
+## Sacred Names (Protected)
+
+<div align="center">
+  <img src="assets/logo.png" alt="" width="42" height="42">
+</div>
+
+The dictionary ships **375 sacred names**, stored **exactly as written in Urdu**,
+across four dedicated sections:
+
+| Section | Count | Contents |
+|---|---|---|
+| `allah` | **213** | أسماء الحسنى — the 99 names of Allah in both bare (`رحمٰن`, `کریم`) and `ال`-prefixed (`الرحمن`, `الکریم`) forms, plus related terms (`اسم اعظم`, `تسبیح`, `تحمید`, `تکبیر`, `تقدیس`) |
+| `nabi` | **54** | أنبياء و رسل — آدم، ادریس، نوح، ہود، صالح، ابراہیم، لوط، اسماعیل، اسحاق، یعقوب، یوسف، ایوب، شعیب، موسی، ہارون، ذوالکفل، داؤد، سلیمان، الیاس، الیسع، یونس، زکریا، یحیی، عیسی، محمد ﷺ (+ احمد، مصطفی، خضر، لقمان، ذوالقرنین …) |
+| `ahlbayt` | **82** | اہل بیت و آلِ علی — علی، حیدر، مرتضی، ابوتراب، اسداللہ، فاطمہ، زہرا، حسن، حسین، زینب، عباس، قاسم، اُمّ کلثوم، اُمّ البنین، the twelve Imams (زین العابدین، باقر، صادق، کاظم، رضا، تقی، نقی، عسکری، مہدی …), the Prophet's household (آمنہ، عبداللہ، ابوطالب، حمزہ، جعفر طیار، حلیمہ) and the mothers of the believers (خدیجہ، عائشہ، حفصہ، اُمّ سلمہ، جویریہ، صفیہ، میمونہ …) |
+| `sahaba` | **41** | صحابہ کرام — ابوبکر، عمر، عثمان، علی، طلحہ، زبیر، عبدالرحمن، سعد، سعید، ابو عبیدہ، ابوذر، سلمان، عمار، بلال، حذیفہ، مقداد، ابوہریرہ، انس، جابر … |
+
+### The guarantee
+
+> **A sacred name is never inflected.** No plural, no suffix, no prefix, no
+> compound head is ever attached to it — in *any* build mode.
+
+This is enforced twice, so it cannot be bypassed:
+
+1. **Section rule** — all four sections use `Rule()` (no morphology) and are listed in `SACRED_SECTIONS`, which the forge skips for every derivation stage, including `--exhaustive`, `--unlimited` and `--recall`.
+2. **Compiler guard** — `is_sacred_derivative()` runs inside `_add()` and rejects any candidate token whose base is a sacred name plus an inflection marker (`وں، یں، اں، ات، ے، ؤں`). Even a future rule change cannot emit `اللہوں`, `محمدوں` or `علیوں`.
+
+`--verify` proves it on the shipped artifact:
+
+```text
+[urduofdani] verifying urdu_database.txt.gz
+    [PASS] gzip readable      73445 bytes packed payload
+    [PASS] sacred names intact 375 present, 0 inflected     <-- the guarantee
+    [PASS] no newline         single line
+    ...
+```
+
+Verified across every tier (build is deterministic, so these numbers are reproducible):
+
+| Mode | Tokens | Sacred names present | Inflected sacred names |
+|---|---|---|---|
+| default | 24,809 | 375 / 375 | **0** |
+| `--exhaustive` | 42,358 | 375 / 375 | **0** |
+| `--unlimited --depth 2` | 56,901 | 375 / 375 | **0** |
+| `--unlimited --depth 4` | 113,793 | 375 / 375 | **0** |
+| `--recall` | 2,596,675 | 375 / 375 | **0** |
+
+### Using them at runtime
+
+Because sacred names live in the same single-space payload, they arrive through the
+same fast path — and behave like any other dictionary word:
+
+```python
+from build_urdu_database import UrduEngine, SACRED_NAMES
+
+engine = UrduEngine()
+print(len(SACRED_NAMES))                      # 375
+print("اللہ" in engine, "محمد" in engine, "فاطمہ" in engine)   # True True True
+print(engine.suggest("علی", 5))               # ['علی', 'علیم', 'علیحدہ', ...]
+print("اللہوں" in engine)                     # False  <- never generated
+```
+
+Practical uses: religious-text normalisation, honorific handling, name-lookup
+fields (madrasa / mosque apps), Islamic calendar & dua tools, and any UI that must
+never auto-pluralise a sacred name.
+
+---
 
 ## 9. How the Compiler Works
 
@@ -682,6 +756,29 @@ Morphology generation — the "compile every variant" step: 0.10 s for the defau
 </details>
 
 <details>
+<summary><b>Why are sacred names never inflected?</b></summary>
+
+Because pluralising or suffixing them would be both grammatically wrong and
+disrespectful. The compiler enforces it twice (a section rule plus
+`is_sacred_derivative()` inside `_add()`), and `--verify` proves it on the shipped
+artifact — see [Sacred Names (Protected)](#sacred-names-protected). Even the
+2.6M-token `--recall` tier contains zero inflected sacred names.
+</details>
+
+<details>
+<summary><b>How do I add more names (prophets, companions, family)?</b></summary>
+
+Append to the relevant block in `build_urdu_database.py`:
+
+```python
+AHL_BAYT_NAMES: str = "... your additions here ..."
+```
+
+Then rebuild — the new names are automatically protected (they enter
+`SACRED_NAMES`, so no rule can inflect them) and `--verify` re-checks the guarantee.
+</details>
+
+<details>
 <summary><b>How do I get <i>even more</i> words?</b></summary>
 
 Three independent dials, all uncapped:
@@ -703,8 +800,8 @@ plural, gender, verb, compound and agentive stages automatically.
 ```text
 urduofdani-dictionary/
 ├── build_urdu_database.py     # the whole engine: compiler + runtime + CLI (stdlib only)
-├── urdu_database.txt.gz       # default database (24,589 words / 70.8 KB)
-├── urdu_database.full.txt.gz  # unlimited build (113,576 words / 315.4 KB)
+├── urdu_database.txt.gz       # default database (24,809 words / 71.7 KB)
+├── urdu_database.full.txt.gz  # unlimited build (113,793 words / 316.5 KB)
 ├── assets/
 │   ├── banner.jpg             # README banner (1600x500, fast-loading)
 │   ├── banner.png             # lossless master of the banner

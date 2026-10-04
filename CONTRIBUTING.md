@@ -39,19 +39,34 @@ python build_urdu_database.py --verify --benchmark 5
 git diff --stat          # urdu_database.txt.gz should change
 ```
 
+### Sacred names - read before touching
+
+`ALLAH_NAMES`, `NABI_NAMES`, `AHL_BAYT_NAMES` and `SAHABA_NAMES` are **protected**:
+
+* their sections use `Rule()` and are listed in `SACRED_SECTIONS`, so no plural,
+  suffix, prefix or compound is ever generated from them;
+* `is_sacred_derivative()` inside `_add()` rejects any token built by adding an
+  inflection marker (`وں، یں، اں، ات، ے، ؤں`) to a sacred name;
+* `--verify` asserts `sacred names intact: N present, 0 inflected`.
+
+When adding a name, keep it as **one token, correct Urdu orthography, no
+honorific phrases** (`محمد` ✅, `محمد صلی اللہ علیہ وسلم` ❌ — that is three tokens).
+If you add a title, add the fused single-token form used in Urdu text
+(`امیرالمومنین`, `خاتمالنبیین`). Never add a separate inflection of a sacred name.
+
 ### Where extra words come from (the mode ladder)
 
 | Mode | Words | Runs in |
 |---|---|---|
-| *(default)* | 24,589 | every build — seeds, plurals, gender, verbs, compounds, curated agentives |
-| `--exhaustive` | 42,138 | section-gated affix families |
-| `--unlimited --depth 1-4` | 47k → 113k | no cap; deeper combinatorics per level |
-| `--recall` | 2,596,456 | raw cross product (machine tier, never a quality claim) |
+| *(default)* | 24,809 | every build — seeds, plurals, gender, verbs, compounds, curated agentives, 375 sacred names |
+| `--exhaustive` | 42,358 | section-gated affix families |
+| `--unlimited --depth 1-4` | 47k → 114k | no cap; deeper combinatorics per level |
+| `--recall` | 2,596,675 | raw cross product (machine tier, never a quality claim) |
 
 Curated seeds are the *quality* dial: every word you add to `ADDITIONAL_SEEDS`,
 `NAME_WORDS`, `MEDICAL_WORDS`, `AGRI_WORDS`, `LAW_WORDS`, `MILITARY_WORDS`,
-`TRANSPORT_WORDS`, `TOOL_WORDS`, `BUSINESS_WORDS`, `RELIGION_WORDS` or
-`SCIENCE_WORDS` multiplies through the plural, gender, verb, compound and
+`TRANSPORT_WORDS`, `TOOL_WORDS`, `BUSINESS_WORDS`, `RELIGION_WORDS`,
+`SCIENCE_WORDS` or the four sacred-name blocks multiplies through the plural, gender, verb, compound and
 agentive stages automatically.
 
 ### Reporting a wrong or missing word

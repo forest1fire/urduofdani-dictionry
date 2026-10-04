@@ -95,6 +95,7 @@ _FOLD_MAP: Dict[int, str] = {
     0x0623: "\u0627",   # أ  -> ا
     0x0625: "\u0627",   # إ  -> ا
     0x0629: "\u06C1",   # ة  -> ہ
+    0x0647: "\u06C1",   # ه  -> ہ  (Arabic heh == Urdu heh)
     0x0643: "\u06A9",   # ك  -> ک
     0x0649: "\u06CC",   # ى  -> ی
     0x064A: "\u06CC",   # ي  -> ی
@@ -210,6 +211,32 @@ def _pluralizable(word: str) -> bool:
     "جوتےاں" or "بکریاںی").
     """
     return not (len(word) > 3 and word.endswith(("وں", "یں", "اں", "ے", "ات")))
+
+
+# Inflection markers that must never attach to a sacred name.
+_INFLECTION_MARKERS: Tuple[str, ...] = ("وں", "یں", "اں", "ات", "ے", "ؤں")
+
+
+def _sacred_set() -> Set[str]:
+    """Canonical form of every sacred name (Allah, Anbiya, Ahl al-Bayt, Sahaba)."""
+    blob = " ".join((ALLAH_NAMES, NABI_NAMES, AHL_BAYT_NAMES, SAHABA_NAMES))
+    return {w for w in (canonicalize(t) for t in blob.split()) if w}
+
+
+def is_sacred_derivative(token: str) -> bool:
+    """True when *token* is a sacred name carrying a plural/case inflection.
+
+    The compiler uses this to guarantee that the dictionary can never contain
+    "اللہوں", "محمدوں" or "علیوں": sacred names are stored exactly as written
+    and are never pluralised, suffixed, prefixed or compounded.
+    """
+    if not SACRED_NAMES or token in SACRED_NAMES:
+        return False
+    for marker in _INFLECTION_MARKERS:
+        if token.endswith(marker) and len(token) > len(marker):
+            if token[:-len(marker)] in SACRED_NAMES:
+                return True
+    return False
 
 
 def _dedupe(items: Iterable[str]) -> List[str]:
@@ -813,6 +840,72 @@ VERB_ROOTS_EXTRA: str = (
     "بچا بچھا بچھ پھیلا پھیلا دینا مان لے لیا ہار جیت "
 )
 
+# ---------------------------------------------------------------------------
+# 2c. SACRED NAMES  (never inflected - see SACRED_NAMES / is_sacred_derivative)
+# ---------------------------------------------------------------------------
+# أسماء الحسنى - the 99 names of Allah, in both the bare and the "ال" form that
+# Urdu religious text actually uses. Respect rule: these words are stored and
+# returned exactly as written; no plural, suffix, prefix or compound is ever
+# generated from them.
+ALLAH_NAMES: str = (
+    "اللہ رب رحمٰن رحیم ملک قدوس سلام مؤمن مہیمن عزیز جبار متکبر خالق بارئ "
+    "مصور غفار قہار وہاب رزاق فتاح علیم قابض باسط خافض رافع معز مذل سمیع "
+    "بصیر حکم عدل لطیف خبیر حلیم عظیم غفور شکور علی کبیر حفیظ مقیت حسیب "
+    "جلیل کریم رقیب مجیب واسع حکیم ودود مجید باعث شہید حق وکیل قوی متین ولی "
+    "حمید محصی مبدئ معید محیی ممیت حی قیوم واجد ماجد واحد احد صمد قادر مقتدر "
+    "مقدم مؤخر اول آخر ظاہر باطن والی متعال بر تواب منتقم عفو رؤف مالک "
+    "ذوالجلال ذوالاکرام مقسط جامع غنی مغنی مانع ضار نافع نور ہادی بدیع باقی "
+    "وارث رشید صبور "
+    "الرحمن الرحیم الملک القدوس السلام المؤمن المہیمن العزیز الجبار المتکبر "
+    "الخالق البارئ المصور الغفار القہار الوہاب الرزاق الفتاح العلیم القابض "
+    "الباسط الخافض الرافع المعز المذل السمیع البصیر الحکم العدل اللطیف الخبیر "
+    "الحلیم العظیم الغفور الشکور العلی الکبیر الحفیظ المقیت الحسیب الجلیل "
+    "الکریم الرقیب المجیب الواسع الحکیم الودود المجید الباعث الشہید الحق "
+    "الوکیل القوی المتین الولی الحمید المحصی المبدئ المعید المحیی الممیت الحی "
+    "القیوم الواجد الماجد الواحد الاحد الصمد القادر المقتدر المقدم المؤخر "
+    "الاول الآخر الظاہر الباطن الوالی المتعال البر التواب المنتقم العفو الرؤف "
+    "المقسط الجامع الغنی المغنی المانع الضار النافع النور الہادی البدیع الباقی "
+    "الوارث الرشید الصبور ذوالجلال ذوالاکرام "
+    "اسم اعظم اسماء تسبیح تحمید تکبیر تقدیس حمد ثنا ذکر ذاکر مسبح "
+)
+
+# Anbiya wa Rusul - the prophets and messengers (Qur'anic 25 plus the figures
+# named in the wider Islamic tradition).
+NABI_NAMES: str = (
+    "آدم ادریس نوح ہود صالح ابراہیم لوط اسماعیل اسحاق یعقوب یوسف ایوب شعیب "
+    "موسی ہارون ذوالکفل داؤد سلیمان الیاس الیسع یونس زکریا یحیی عیسی محمد "
+    "احمد مصطفی مجتبی مرتضی شیت خضر لقمان عزیر یوشع اشموئیل شموئیل ذوالقرنین "
+    "نبی انبیا نبیوں رسول رسل رسالت پیغمبر پیغمبروں نبوت وحی رسالت "
+    "خاتم النبیین خاتمالنبیین رحمۃ اللعالمین رحمۃللعالمین "
+)
+
+# اہل بیت - the household of the Prophet ﷺ and the family of Hazrat Ali,
+# including the twelve Imams and the family of Hazrat Fatima.
+AHL_BAYT_NAMES: str = (
+    "علی حیدر اسداللہ ابوتراب مرتضی امیرالمومنین ذوالفقار فاطمہ زہرا زہراء "
+    "بتول سیدہ حسن حسین زینب کلثوم امالبنین امکلثوم رقیہ امکلثوم سکینہ "
+    "عباس قاسم عبداللہ جعفر عقیل عون محمداکبر محمداصغر طیب طاہر مطہر "
+    "زینالعابدین سجاد باقر صادق کاظم رضا تقی جواد نقی ہادی عسکری مہدی "
+    "قائم حجت منتظر نرجس حمیرا شہربانو فضہ "
+    "عبداللہ آمنہ ابوطالب ابوطالب ابولہب حمزہ عباس جعفرطیار عقیل امہانی "
+    "صفیہ اروی حلیمہ ثویبہ شیماء زبیر "
+    "خدیجہ سودہ عائشہ حفصہ زینب امسلمہ جویریہ امحبیبہ میمونہ ماریہ قبطیہ "
+    "نجف کربلا کوفہ سامرہ"
+)
+
+# Sahaba - the companions, starting with the four rightly-guided caliphs and
+# the ten given glad tidings of paradise.
+SAHABA_NAMES: str = (
+    "ابوبکر صدیق عمر فاروق عثمان غنی ذوالنورین طلحہ زبیر عبدالرحمن سعد سعید "
+    "ابوعبیدہ ابوذر سلمان عمار بلال حذیفہ مقداد ابوہریرہ انس جابر ابنمسعود "
+    "معاذ ابی زید اسامہ خالد ولید ارقم مصعب عکرمہ نعیم ضحاک ثابت ربیعہ "
+    "صحابی صحابہ صحابیہ صحابہ کرام "
+)
+
+# Canonical (folded) form of every sacred name. Built once at import, then used
+# as the hard guard that keeps the dictionary from ever inflecting them.
+SACRED_NAMES: Set[str] = _sacred_set()
+
 # Explicit irregular / idiomatic derivations that no rule should invent.
 EXTRA_FORMS: Dict[str, Tuple[str, ...]] = {
     "باغ": ("باغبان", "باغیچہ", "باغات", "باغوں"),
@@ -962,6 +1055,9 @@ PREFIX_SAFE_SECTIONS: Dict[str, Tuple[str, ...]] = {
 # Sections that are stored but never inflected (names, function words, numbers).
 NON_INFLECTING_SECTIONS: Set[str] = {"proper", "name", "function", "number"}
 
+# Sacred sections: stored verbatim, excluded from every derivation stage.
+SACRED_SECTIONS: Set[str] = {"allah", "nabi", "ahlbayt", "sahaba"}
+
 # Sections that take derivational expansion in --exhaustive mode (loanwords,
 # function words and numbers are excluded: expanding them only creates noise).
 EXHAUSTIVE_SECTIONS: Tuple[str, ...] = (
@@ -1015,6 +1111,10 @@ RULES: Dict[str, Rule] = {
     "nature": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
     "place": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا", "والی")),
     "proper": Rule(),                      # names stay untouched
+    "allah": Rule(),                       # sacred - never inflected
+    "nabi": Rule(),                        # sacred - never inflected
+    "ahlbayt": Rule(),                     # sacred - never inflected
+    "sahaba": Rule(),                      # sacred - never inflected
     "name": Rule(),                        # person names stay untouched
     "person": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
     "body": Rule(plurals="urdu", suffixes=("ی",), modifiers=("والا",)),
@@ -1123,6 +1223,8 @@ class LexiconForge:
         token = canonicalize(raw, self.keep_diacritics)
         if not token or token in self._seen or not is_valid_token(token, self.min_len, self.max_len):
             return False
+        if is_sacred_derivative(token):        # never inflect a sacred name
+            return False
         self._seen.add(token)
         sink.append(token)
         self.stats[bucket] = self.stats.get(bucket, 0) + 1
@@ -1170,6 +1272,10 @@ class LexiconForge:
             "military": split(MILITARY_WORDS),
             "business": split(BUSINESS_WORDS),
             "agri": split(AGRI_WORDS),
+            "allah": split(ALLAH_NAMES),
+            "nabi": split(NABI_NAMES),
+            "ahlbayt": split(AHL_BAYT_NAMES),
+            "sahaba": split(SAHABA_NAMES),
             "education": split(EDUCATION_WORDS),
             "tech": split(TECH_WORDS),
             "sport": split(SPORT_WORDS),
@@ -1205,6 +1311,8 @@ class LexiconForge:
 
         # stages 2-6 - per-section morphology
         for name, words in sections.items():
+            if name in SACRED_SECTIONS:        # sacred names are never derived
+                continue
             self._apply_rule(name, words, out)
 
         # stage 7 - verbs (conjugation families)
@@ -1317,7 +1425,7 @@ class LexiconForge:
         heads_wide = ("منڈی", "بازار", "دکان", "گودام", "اڈہ", "گھر")
 
         for name, words in sections.items():
-            if name in NON_INFLECTING_SECTIONS:
+            if name in NON_INFLECTING_SECTIONS or name in SACRED_SECTIONS:
                 continue
             human = name in HUMAN_SECTIONS
             quality_sec = name in QUALITY_SECTIONS
@@ -1978,8 +2086,11 @@ def verify_database(path: str | os.PathLike[str] = DB_FILENAME,
     text = raw.decode("utf-8")
     words = text.split(SEPARATOR)
 
+    present_sacred = sum(1 for w in words if w in SACRED_NAMES)
     checks: List[Tuple[str, bool, str]] = [
         ("gzip readable", True, "%d bytes packed payload" % path.stat().st_size),
+        ("sacred names intact", not any(is_sacred_derivative(w) for w in words),
+         "%d present, 0 inflected" % present_sacred),
         ("no newline", "\n" not in text and "\r" not in text, "single line"),
         ("no comma", "," not in text, "comma-free"),
         ("no digits", not _FORBIDDEN.search(text), "digit-free"),
